@@ -37,60 +37,125 @@ The project provides a practical environment for learning AWS cloud infrastructu
 | Identity & Access | AWS IAM | Roles and permissions |
 | Encryption | AWS KMS | Encryption key management |
 | CI/CD | GitHub Actions | Automated workflows |
-| Authentication | GitHub OIDC (application pipeline) | Federated AWS authentication without stored keys |
+| Authentication | AWS Access Keys | AWS authentication using IAM access key credentials |
 | Remote State | Amazon S3 | Terraform state storage |
 | State Locking | Terraform S3 Lockfile | State concurrency protection |
 | Version Control | Git & GitHub | Source code management |
 
 ## 🏗️ Architecture
 
-The infrastructure follows a multi-AZ VPC architecture with public and private subnets.
+<p align="center">
+  <b>AWS EKS — Multi-AZ Infrastructure Architecture</b>
+</p>
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'Arial','fontSize':'14px','lineColor':'#64748b','primaryTextColor':'#1e293b'},'flowchart':{'curve':'basis','nodeSpacing':35,'rankSpacing':55}}}%%
 flowchart TB
-    DEV["Developer"] --> GH["GitHub Repository"]
-    GH --> GA["GitHub Actions"]
-    GA --> OIDC["GitHub OIDC (application pipeline)"]
-    OIDC --> IAM["AWS IAM Roles"]
 
-    subgraph AWS["AWS Cloud - us-east-1"]
-        subgraph VPC["VPC - 10.0.0.0/16"]
-            subgraph PUBLIC["Public Subnets - 2 AZs"]
-                NAT["NAT Gateway"]
-            end
+    DEV(["👨‍💻 Developer"])
+    GH["GitHub Repository"]
+    GHA["GitHub Actions<br/>Terraform & Application CI/CD"]
+    OIDC["GitHub OIDC<br/>(prepared, not active)"]
+    IAM["AWS IAM Roles"]
 
-            subgraph PRIVATE["Private Subnets - 2 AZs"]
-                EKS["Amazon EKS Cluster"]
-                NODES["Managed Worker Nodes"]
-            end
+    DEV --> GH
+    GH --> GHA
+    GHA --> OIDC
+    OIDC --> IAM
 
-            EKS --> NODES
-            NODES --> NAT
+    subgraph AWS["☁️ AWS CLOUD — us-east-1"]
+      direction TB
+
+      S3[("Amazon S3<br/>Terraform Remote State")]
+      ECR[("Amazon ECR<br/>Private Image Registry")]
+      KMS["AWS KMS<br/>Encryption"]
+
+      subgraph VPC["🌐 VPC — 10.0.0.0/16"]
+        direction TB
+
+        IGW["Internet Gateway"]
+
+        subgraph AZ1["Availability Zone 1"]
+          direction TB
+          PUB1["Public Subnet"]
+          NAT["NAT Gateway"]
+          PRIV1["Private Subnet"]
+          NODE1["EKS Worker Node 1"]
+          PUB1 --> NAT
+          PRIV1 --> NODE1
         end
 
-        ECR["Amazon ECR"]
-        KMS["AWS KMS"]
-        S3["S3 Terraform Remote State"]
+        subgraph AZ2["Availability Zone 2"]
+          direction TB
+          PUB2["Public Subnet"]
+          PRIV2["Private Subnet"]
+          NODE2["EKS Worker Node 2"]
+          PRIV2 --> NODE2
+        end
+
+        EKS["Amazon EKS<br/>Managed Control Plane<br/>(ENIs in private subnets)"]
+
+        IGW --> PUB1
+        IGW --> PUB2
+        NAT --> PRIV1
+        NAT -. "Shared outbound route" .-> PRIV2
+        EKS --> NODE1
+        EKS --> NODE2
+      end
     end
 
     IAM --> EKS
     IAM --> ECR
-    GA -->|"IAM user keys (Terraform workflow)"| S3
+    GHA -. "IAM user keys (Terraform workflow)" .-> S3
+    NODE1 --> ECR
+    NODE2 --> ECR
     EKS --> KMS
+
+    classDef developer fill:#e0f2fe,stroke:#0284c7,color:#075985,stroke-width:2px;
+    classDef github fill:#f1f5f9,stroke:#475569,color:#0f172a,stroke-width:2px;
+    classDef identity fill:#fef3c7,stroke:#d97706,color:#92400e,stroke-width:2px;
+    classDef network fill:#dbeafe,stroke:#2563eb,color:#1e40af,stroke-width:2px;
+    classDef private fill:#dcfce7,stroke:#16a34a,color:#166534,stroke-width:2px;
+    classDef kubernetes fill:#ede9fe,stroke:#7c3aed,color:#5b21b6,stroke-width:2px;
+    classDef storage fill:#ffedd5,stroke:#ea580c,color:#9a3412,stroke-width:2px;
+    classDef security fill:#fce7f3,stroke:#db2777,color:#9d174d,stroke-width:2px;
+
+    class DEV developer;
+    class GH,GHA github;
+    class OIDC,IAM identity;
+    class IGW,PUB1,PUB2 network;
+    class PRIV1,PRIV2,NAT private;
+    class EKS,NODE1,NODE2 kubernetes;
+    class S3,ECR storage;
+    class KMS security;
+
+    style AWS fill:#f8fafc,stroke:#64748b,stroke-width:3px
+    style VPC fill:#eff6ff,stroke:#2563eb,stroke-width:2px
+    style AZ1 fill:#f0f9ff,stroke:#0ea5e9,stroke-width:2px
+    style AZ2 fill:#f0fdf4,stroke:#22c55e,stroke-width:2px
 ```
 
-### Architecture Highlights
+### 🎨 Architecture Legend
 
-- Custom VPC with CIDR `10.0.0.0/16`.
-- Two Availability Zones.
-- Two public subnets and two private subnets.
-- NAT Gateway for private subnet outbound connectivity.
-- Amazon EKS managed Kubernetes control plane.
-- Private managed worker nodes.
-- Amazon ECR private image repositories.
-- AWS KMS encryption integration.
-- S3 remote Terraform state with native state locking.
-- GitHub Actions authentication using OIDC for the application pipeline. The Terraform workflow currently authenticates with an IAM user's access keys stored as repository secrets.
+| Color | Component |
+|---|---|
+| 🔵 Blue | Networking & VPC |
+| 🟢 Green | Private Subnets |
+| 🟣 Purple | Kubernetes & EKS |
+| 🟠 Orange | AWS Storage Services |
+| 🩷 Pink | Encryption & Security |
+| 🟡 Yellow | IAM & Identity |
+| ⚪ Grey | GitHub & CI/CD |
+
+### Key Architecture Features
+
+- Multi-AZ network architecture.
+- Public and private subnet separation.
+- Private EKS worker nodes.
+- Centralized IAM roles. GitHub Actions currently authenticates to AWS with IAM user access keys stored as repository secrets; GitHub OIDC roles are prepared in Terraform but not active.
+- Private ECR image registry.
+- Encrypted Terraform remote state.
+- KMS-based encryption integration.
 
 ## ⚙️ Infrastructure Components
 
@@ -229,7 +294,7 @@ Build Container Image
 Security Scan
     |
     v
-AWS Authentication - OIDC (main branch only)
+AWS Authentication (OIDC role prepared, not yet provisioned)
     |
     v
 Push Image to Amazon ECR
@@ -395,7 +460,7 @@ The infrastructure configuration incorporates several security practices:
 - Private worker nodes.
 - Restricted EKS API endpoint configuration.
 - IAM roles and scoped policies.
-- GitHub OIDC authentication configuration (application pipeline).
+- Optional GitHub OIDC configuration (prepared in Terraform, not active).
 - Encrypted Terraform plan artifact.
 - S3 public access blocking.
 - TLS-only S3 access.
