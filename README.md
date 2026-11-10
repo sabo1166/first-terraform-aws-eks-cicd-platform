@@ -58,14 +58,12 @@ The project provides a practical environment for learning AWS cloud infrastructu
 
 | Marker | Meaning |
 |---|---|
-| Cyan flow | Git push / CI trigger |
-| Orange flow | Terraform provisioning and remote state |
-| Green flow | Node egress through NAT Gateway and Internet Gateway |
-| Purple flow | EKS control plane ⇄ worker nodes |
-| Blue flow | Container image delivery (ECR → nodes) |
-| Solid box | Defined in Terraform |
-| Amber dashed | Prepared, not active (GitHub OIDC) |
-| Grey dashed | Not deployed (Kubernetes workloads) |
+| Solid box or line | Configured in Terraform (or in the workflows) |
+| White flow | Developer → GitHub → GitHub Actions → AWS authentication (IAM access key) |
+| Orange flow | Terraform calling AWS APIs; container image pull (ECR → worker nodes) |
+| Purple flow | EKS control plane → managed node group |
+| Amber dashed | Not used: GitHub OIDC is prepared in Terraform, but authentication uses the GitHub Actions access key |
+| Cyan dotted | Conceptual, not deployed (example pods) |
 
 ### Key Architecture Features
 
