@@ -19,6 +19,10 @@
 # Only `workflow_dispatch`: nothing here runs on push or pull_request.
 # Setup (secrets, variables, GitHub Environment): see docs/OPERATIONS.md "Terraform workflow".
 #
+# DELETE GUARD: a plan that deletes or replaces ANY resource is never offered for CI
+# apply (checked in the plan job and again on the decrypted plan in the apply job).
+# Deletions must be reviewed and applied by an administrator.
+#
 # IMPORTANT: this uses the CI identity (AWS access keys), which has NO IAM, KMS or
 # EC2/VPC write permissions (they are Admin-only). A plan that changes those
 # resources is reported, but is NOT offered for apply. Apply it as an admin instead.
@@ -56,7 +60,7 @@ env:
   TF_INPUT: "false"
   # Existing state bucket, created manually in the AWS Console. It must match terraform/backend.tf
   # (the backend reads its bucket from there, so `terraform init` needs no extra arguments).
-  TF_VAR_tfstate_bucket_name: moh-terraform-state-2026-unique
+  TF_VAR_tfstate_bucket_name: moh-terraform-state-2026-uniq
   # Non-secret configuration (repository variable, not a secret). tfvars files are not committed.
   TF_VAR_public_access_cidrs: ${{ vars.PUBLIC_ACCESS_CIDRS }} # JSON list, e.g. ["203.0.113.10/32"]; never 0.0.0.0/0
 
@@ -238,24 +242,29 @@ jobs:
           with open(sys.argv[1]) as f:
               plan = json.load(f)
           for rc in plan.get("resource_changes") or []:
-              if rc["change"]["actions"] in (["no-op"], ["read"]):
+              actions = rc["change"]["actions"]
+              if actions in (["no-op"], ["read"]):
                   continue
-              if rc["type"] not in allowed:
-                  print(rc["address"])
+              # Delete guard: CI never applies a plan that deletes or replaces anything
+              # (actions contain "delete": delete, delete+create, create+delete).
+              if "delete" in actions:
+                  print(f'{rc["address"]}  [{"+".join(actions)}] deletes or replaces a resource')
+              elif rc["type"] not in allowed:
+                  print(f'{rc["address"]}  [{"+".join(actions)}] resource type not allowed for CI')
           PY
           )"
           rm -f "$RUNNER_TEMP/plan.json"   # may contain sensitive values
           if [ -n "$blocked" ]; then
             echo "ci_applicable=false" >> "$GITHUB_OUTPUT"
             {
-              echo "### Plan needs an administrator"
-              echo "This plan changes resources the CI identity is not allowed to apply."
-              echo "Review the plan above, then apply as an admin. Nothing was uploaded and no approval is offered."
+              echo "### Plan blocked from CI apply"
+              echo "This plan deletes or replaces resources, or changes resources the CI identity is not allowed to apply."
+              echo "Review the plan above, then apply as an administrator. Nothing was uploaded and no approval is offered."
               echo '```'
               echo "$blocked"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::warning::plan contains admin-only changes; CI apply is not offered"
+            echo "::warning::plan contains deletions/replacements or admin-only changes; CI apply is not offered"
           else
             echo "ci_applicable=true" >> "$GITHUB_OUTPUT"
           fi
@@ -365,6 +374,29 @@ jobs:
             --passphrase-fd 0 --decrypt --output tfplan tfplan.gpg
           rm -f tfplan.gpg
 
+      - name: Delete guard (re-check the decrypted plan)
+        # Defence in depth: the plan job already blocks deletions, but the apply job
+        # re-checks the exact file it is about to apply and refuses on any delete/replace.
+        run: |
+          set -euo pipefail
+          terraform -chdir="$TF_WORKING_DIR" show -json tfplan > "$RUNNER_TEMP/plan.json"
+          deletes="$(python3 -I - "$RUNNER_TEMP/plan.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1]) as f:
+              plan = json.load(f)
+          for rc in plan.get("resource_changes") or []:
+              if "delete" in rc["change"]["actions"]:
+                  print(rc["address"] + "  [" + "+".join(rc["change"]["actions"]) + "]")
+          PY
+          )"
+          rm -f "$RUNNER_TEMP/plan.json"   # may contain sensitive values
+          if [ -n "$deletes" ]; then
+            echo "::error::the saved plan deletes or replaces resources; CI apply refused"
+            echo "$deletes"
+            rm -f "$TF_WORKING_DIR/tfplan"
+            exit 1
+          fi
+
       - name: Terraform Apply
         # Applies the saved plan exactly as approved. Terraform refuses it if the
         # state changed since the plan was made. No new plan is generated here.
@@ -375,4 +407,4 @@ jobs:
 
       - name: Remove local plan files
         if: always()
-        run: rm -f "$TF_WORKING_DIR/tfplan" "$TF_WORKING_DIR/tfplan.gpg"
+        run: rm -f "$TF_WORKING_DIR/tfplan" "$TF_WORKING_DIR/tfplan.gpg" "$RUNNER_TEMP/plan.json"

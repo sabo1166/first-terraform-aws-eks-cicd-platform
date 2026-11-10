@@ -1,6 +1,6 @@
 # OPTIONAL. terraform/backend.tf already points at the existing state bucket
-# (moh-terraform-state-2026-unique, created manually in the AWS Console).
+# (moh-terraform-state-2026-uniq, created manually in the AWS Console).
 # Use this file only to override the bucket (for example in a different account):
 # copy it to backend.hcl (gitignored), then run
 #   terraform init -reconfigure -backend-config=backend.hcl
-bucket = "moh-terraform-state-2026-unique"
+bucket = "moh-terraform-state-2026-uniq"

@@ -68,7 +68,7 @@ Never commit credentials, `*.tfstate`, `*.tfplan` or `*.tfvars` (all gitignored)
 
 ### 1. State bucket (created manually in the AWS Console)
 
-The remote-state bucket `moh-terraform-state-2026-unique` (us-east-1) **already exists**. It was created manually through the AWS Console, not by Terraform. The main configuration only uses it: `terraform/backend.tf` names the bucket and Terraform never creates it.
+The remote-state bucket `moh-terraform-state-2026-uniq` (us-east-1) **already exists**. It was created manually through the AWS Console, not by Terraform. The main configuration only uses it: `terraform/backend.tf` names the bucket and Terraform never creates it.
 
 `terraform/bootstrap/` is **not needed for this bucket and must not be run**. It is kept only as a record of the intended bucket settings and as a starting point if a replacement bucket is ever needed. Running it would try to create a bucket that already exists.
 
@@ -137,18 +137,48 @@ Approving: open the run, click **Review deployments** on the waiting `Terraform 
 
 Safeguards: runs are serialized (`concurrency: terraform-infra`, never cancelled); apply only runs on `main`; if the plan has no changes, nothing is uploaded and no approval is requested.
 
+**Delete guard.** CI never applies a plan that deletes or replaces anything. The plan job inspects the saved plan (`terraform show -json`) and, if any resource has a `delete` action (delete, delete+create, create+delete), it uploads nothing, offers no approval, and lists the blocked resources and their actions in the run summary. The apply job also re-checks the decrypted plan right before `terraform apply` and fails if it finds any delete or replace, so the guard cannot be bypassed by the apply job. Deletions and replacements must be reviewed and applied by an administrator.
+
 **Important: what CI may apply.** The CI identity has no IAM, KMS or EC2/VPC write permissions (Admin-only). The plan job checks the plan against an allow-list (EKS cluster/node group/access entries, ECR repository + lifecycle policy, the control-plane log group). If the plan changes anything else, it is still shown for review but is **not** uploaded and **no apply is offered**: apply those changes as an administrator. This means the first provisioning of the stack must be done by an admin, not by this workflow.
+
+### Root cause of the "S3 bucket ... does not exist" init failure
+`terraform init` failed with `S3 bucket "moh-terraform-state-2026-unique" does not exist.` The real state bucket is `moh-terraform-state-2026-uniq`, but the repository hardcoded the wrong name (`...-unique`) in `terraform/backend.tf`, the workflow, variable defaults and docs. The backend block cannot use variables and the workflow does not read a `TFSTATE_BUCKET_NAME` variable, so setting that GitHub variable had no effect. The name is now `moh-terraform-state-2026-uniq` everywhere. No state was migrated: the old name never existed as a bucket.
+
+If you ever change the bucket name again, update all of: `terraform/backend.tf`, `TF_VAR_tfstate_bucket_name` in `terraform.yml`, `tfstate_bucket_name` in `terraform/variables.tf`, and the example files. On a machine with an older `.terraform/` directory, `terraform init` may ask for `-reconfigure`; do that only after confirming no state lives in the old location.
+
+### Required S3 IAM permissions for the state backend
+The CI IAM user (and any admin running Terraform locally) needs, on the state bucket `moh-terraform-state-2026-uniq`:
+- `s3:ListBucket` and `s3:GetBucketLocation` on `arn:aws:s3:::moh-terraform-state-2026-uniq`
+- `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on `arn:aws:s3:::moh-terraform-state-2026-uniq/eks-cicd-platform/terraform.tfstate` and `.../eks-cicd-platform/terraform.tfstate.tflock` (the `.tflock` object is the native S3 lock file; `DeleteObject` is needed to release it)
+
+These come from `terraform/modules/iam/github_deploy_policy.tf` (statements `StateBucketList` and `StateObjects`), which is built from `tfstate_bucket_name` and `tfstate_key`.
+
+**An administrator must update the IAM policy before CI can use the renamed bucket.** The deployed CI policy was most likely created with the old name `...-unique`, so until it is updated the CI user will get AccessDenied on `terraform init`. Steps (administrator, outside CI):
+1. Run `terraform plan` locally with admin credentials and confirm the only change is the deploy policy document (bucket name in the two state statements).
+2. Review it, then apply it as an administrator (this workflow cannot: IAM writes are Admin-only, and it is also admin-only because the plan changes `aws_iam_policy`).
+3. Re-run the `infra Terraform` workflow.
+
+### How the `production` environment approval works
+The apply job declares `environment: production`. GitHub pauses that job before any step runs until a **required reviewer** approves. This is the human approval; `workflow_dispatch` itself is only the trigger, not an approval. The approval gate exists **only if you configure it** in GitHub (the repository files cannot enforce it):
+1. Repository **Settings → Environments → New environment** (or open `production`).
+2. Enable **Required reviewers** and add at least one person (up to 6). Private repositories need GitHub Pro/Team/Enterprise for this.
+3. Optionally enable **Prevent self-review** (only helps with 2 or more reviewers).
+4. Under **Deployment branches and tags** choose **Selected branches** and allow only `main`.
+5. Verify: run the workflow and check that the `4 - Terraform Apply` job shows "Waiting" with a **Review deployments** button before it starts.
+
+### Safe deployment procedure
+1. Make sure the code is on `main` and the IAM policy update above is done.
+2. Actions → *infra Terraform* → Run workflow on `main`.
+3. Read the `3 - Terraform Plan` job output (and summary). If it says "Plan blocked from CI apply", nothing is offered; hand it to an administrator.
+4. Only if the plan is exactly what you expect, open the waiting apply job → **Review deployments** → approve. Otherwise reject.
+5. Check the job's `terraform output` and confirm the result. Plan artifacts expire after 1 day, so a plan not approved in time must be re-run.
 
 Required configuration:
 - **Repository secrets:** `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (keys of the Terraform CI IAM user, created manually), `TF_PLAN_ENCRYPTION_KEY` (a long random passphrase, e.g. `openssl rand -base64 32`; never reuse another secret).
-- **Repository variables:** `PUBLIC_ACCESS_CIDRS` (JSON list, e.g. `["203.0.113.10/32"]`, never `0.0.0.0/0`). The state bucket is no longer a variable: it is fixed as `moh-terraform-state-2026-unique` in `terraform/backend.tf` and in the workflow (`TF_VAR_tfstate_bucket_name`).
+- **Repository variables:** `PUBLIC_ACCESS_CIDRS` (JSON list, e.g. `["203.0.113.10/32"]`, never `0.0.0.0/0`). The state bucket is no longer a variable: it is fixed as `moh-terraform-state-2026-uniq` in `terraform/backend.tf` and in the workflow (`TF_VAR_tfstate_bucket_name`).
 - **Environment `production`** (Settings → Environments): required reviewers, optionally prevent self-review, deployment branches limited to `main`. It is shared with the application workflow.
 - Settings that only exist in your local `terraform.tfvars` are not seen by CI. Anything non-default that CI cannot apply (e.g. `github_repository`) must not be set for CI, or the plan will propose admin-only changes.
 - Plan artifacts are encrypted, but anyone who can read the repository can still download the ciphertext. Treat the passphrase and the AWS keys as sensitive, and move to OIDC when practical.
-
-## Application CI/CD (GitHub Actions)
-
-The application pipeline is `.github/workflows/eks-cicd.yml`.
 
 ## Application CI/CD (GitHub Actions)
 

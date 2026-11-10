@@ -132,7 +132,7 @@ variable "log_retention_days" {
 variable "tfstate_bucket_name" {
   description = "Name of the existing Terraform state bucket (created manually in the AWS Console). Must match the bucket in backend.tf. Used only to scope the GitHub Actions deploy policy."
   type        = string
-  default     = "moh-terraform-state-2026-unique"
+  default     = "moh-terraform-state-2026-uniq"
 }
 
 variable "tfstate_key" {

@@ -134,7 +134,7 @@ Created a modular Terraform project structure to separate infrastructure resourc
 
 ### Step 2 — Remote State Bucket
 
-Prepared a Terraform bootstrap configuration for the S3 state bucket. The bucket itself (`moh-terraform-state-2026-unique`, us-east-1) was created manually through the AWS Console, so the bootstrap configuration is kept for reference only and is not run.
+Prepared a Terraform bootstrap configuration for the S3 state bucket. The bucket itself (`moh-terraform-state-2026-uniq`, us-east-1) was created manually through the AWS Console, so the bootstrap configuration is kept for reference only and is not run.
 
 ### Step 3 — AWS Networking
 
@@ -323,7 +323,7 @@ aws sts get-caller-identity
 
 ### 3. State Bucket (already created)
 
-The S3 bucket for Terraform remote state, `moh-terraform-state-2026-unique` in `us-east-1`, was **created manually through the AWS Console**. Terraform only uses it as the backend and never creates it, so `terraform/bootstrap/` is not needed for this bucket. Do not run it.
+The S3 bucket for Terraform remote state, `moh-terraform-state-2026-uniq` in `us-east-1`, was **created manually through the AWS Console**. Terraform only uses it as the backend and never creates it, so `terraform/bootstrap/` is not needed for this bucket. Do not run it.
 
 In the AWS Console, confirm the bucket has **Versioning enabled** (new buckets have it off), default encryption on, and **Block all public access** on.
 

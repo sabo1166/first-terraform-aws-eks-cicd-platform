@@ -9,7 +9,7 @@
 # in .github/workflows/terraform.yml.
 terraform {
   backend "s3" {
-    bucket       = "moh-terraform-state-2026-unique"
+    bucket       = "moh-terraform-state-2026-uniq"
     key          = "eks-cicd-platform/terraform.tfstate"
     region       = "us-east-1"
     encrypt      = true
