@@ -1,3 +1,6 @@
-# Copy to backend.hcl (gitignored) and set the bucket created by ./bootstrap:
-#   terraform init -backend-config=backend.hcl
-bucket = "REPLACE-WITH-YOUR-STATE-BUCKET-NAME"
+# OPTIONAL. terraform/backend.tf already points at the existing state bucket
+# (moh-terraform-state-2026-unique, created manually in the AWS Console).
+# Use this file only to override the bucket (for example in a different account):
+# copy it to backend.hcl (gitignored), then run
+#   terraform init -reconfigure -backend-config=backend.hcl
+bucket = "moh-terraform-state-2026-unique"

@@ -1,6 +1,6 @@
 # Operations guide: setup, permissions and workflows
 
-> Detailed operating documentation for [terraform-aws-eks-cicd-platform](../README.md): bootstrap and setup commands, the Admin/CI permission boundary, both GitHub Actions workflows, required GitHub settings, cost and cleanup.
+> Detailed operating documentation for [terraform-aws-eks-cicd-platform](../README.md): setup commands, the Admin/CI permission boundary, both GitHub Actions workflows, required GitHub settings, cost and cleanup.
 
 Terraform foundation for deploying a Kubernetes application on Amazon EKS, with
 images in Amazon ECR and CI through GitHub Actions.
@@ -24,7 +24,7 @@ images in Amazon ECR and CI through GitHub Actions.
    |        \__ EKS managed node group (2 x t3.medium) __/       |
    |  EKS control plane ENIs in the private subnets              |
    ---------------------------------------------------------------
-   ECR (immutable tags, scan on push)     S3 state bucket (bootstrap)
+   ECR (immutable tags, scan on push)     S3 state bucket (manual)
 ```
 
 - Worker nodes run in **private** subnets only and reach the internet through one NAT gateway.
@@ -36,7 +36,7 @@ images in Amazon ECR and CI through GitHub Actions.
 
 ```
 terraform/
-  bootstrap/        S3 state bucket (local state, run once)
+  bootstrap/        reference only, NOT used (the state bucket was created manually)
   modules/vpc|eks|ecr|iam
   main.tf providers.tf variables.tf outputs.tf versions.tf backend.tf
   backend.hcl.example  terraform.tfvars.example
@@ -66,19 +66,17 @@ Never commit credentials, `*.tfstate`, `*.tfplan` or `*.tfvars` (all gitignored)
 
 ## Setup
 
-### 1. Bootstrap the state bucket (once, local state)
+### 1. State bucket (created manually in the AWS Console)
 
-The backend bucket must exist before the main configuration is initialized, so it
-is created separately with local state.
+The remote-state bucket `moh-terraform-state-2026-unique` (us-east-1) **already exists**. It was created manually through the AWS Console, not by Terraform. The main configuration only uses it: `terraform/backend.tf` names the bucket and Terraform never creates it.
 
-```powershell
-cd terraform/bootstrap
-terraform init
-terraform plan  -var "state_bucket_name=<globally-unique-bucket-name>"
-terraform apply -var "state_bucket_name=<globally-unique-bucket-name>"
-```
+`terraform/bootstrap/` is **not needed for this bucket and must not be run**. It is kept only as a record of the intended bucket settings and as a starting point if a replacement bucket is ever needed. Running it would try to create a bucket that already exists.
 
-Keep the small local `terraform.tfstate` in `bootstrap/` safe (it is gitignored). The bucket has versioning, AES256 encryption, a full public access block, a TLS-only policy, and `prevent_destroy`.
+Check these settings in the Console (a manually created bucket does not get them all by default):
+- **Bucket Versioning: Enabled** (new buckets have it off; it lets you recover older state).
+- Default encryption: on (SSE-S3 / AES-256).
+- **Block all public access: on.**
+- Optional: a bucket policy that denies requests without TLS.
 
 ### 2. Configure `public_access_cidrs`
 
@@ -101,7 +99,7 @@ Terraform itself only calls AWS APIs, so CI does not need API-server access for 
 ```powershell
 cd terraform
 Copy-Item terraform.tfvars.example terraform.tfvars   # then edit the values
-terraform init -backend-config="bucket=<your-state-bucket>"
+terraform init
 terraform fmt -recursive
 terraform validate
 terraform plan -out=tfplan
@@ -124,7 +122,7 @@ Review the plan carefully before any apply. `terraform apply` is intentionally n
 Compatible with a workflow that runs `fmt`, `init`, `validate` and `plan`. The workflow needs:
 
 - Secrets: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (keys for the Terraform-managed IAM user, created manually in the console/CLI; Terraform never creates them).
-- Env/variables: `TF_VAR_public_access_cidrs`, `TF_VAR_tfstate_bucket_name`, and `terraform init -backend-config="bucket=..."`.
+- Env/variables: `TF_VAR_public_access_cidrs`. The state bucket is fixed in `backend.tf`; `terraform init` needs no extra arguments.
 
 Two workflows: `.github/workflows/terraform.yml` (infrastructure, below) and `.github/workflows/eks-cicd.yml` (application, described after it).
 
@@ -143,7 +141,7 @@ Safeguards: runs are serialized (`concurrency: terraform-infra`, never cancelled
 
 Required configuration:
 - **Repository secrets:** `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (keys of the Terraform CI IAM user, created manually), `TF_PLAN_ENCRYPTION_KEY` (a long random passphrase, e.g. `openssl rand -base64 32`; never reuse another secret).
-- **Repository variables:** `TFSTATE_BUCKET_NAME`, `PUBLIC_ACCESS_CIDRS` (JSON list, e.g. `["203.0.113.10/32"]`, never `0.0.0.0/0`).
+- **Repository variables:** `PUBLIC_ACCESS_CIDRS` (JSON list, e.g. `["203.0.113.10/32"]`, never `0.0.0.0/0`). The state bucket is no longer a variable: it is fixed as `moh-terraform-state-2026-unique` in `terraform/backend.tf` and in the workflow (`TF_VAR_tfstate_bucket_name`).
 - **Environment `production`** (Settings → Environments): required reviewers, optionally prevent self-review, deployment branches limited to `main`. It is shared with the application workflow.
 - Settings that only exist in your local `terraform.tfvars` are not seen by CI. Anything non-default that CI cannot apply (e.g. `github_repository`) must not be set for CI, or the plan will propose admin-only changes.
 - Plan artifacts are encrypted, but anyone who can read the repository can still download the ciphertext. Treat the passphrase and the AWS keys as sensitive, and move to OIDC when practical.
@@ -201,7 +199,7 @@ These are separate from the Terraform-management identity (`modules/iam/github_a
 
 ## AWS permissions
 
-**For a human/admin running bootstrap:** S3 bucket creation and configuration (`s3:CreateBucket`, `PutBucketVersioning`, `PutEncryptionConfiguration`, `PutBucketPublicAccessBlock`, `PutBucketOwnershipControls`, `PutLifecycleConfiguration`, `PutBucketPolicy`, plus the matching `Get*`).
+**For the state bucket:** it was created manually in the AWS Console, so no Terraform permissions are needed to create it. `terraform/bootstrap` is not run.
 
 **For the first apply of the main stack, and any change to IAM, KMS, or EC2/VPC resources:** use an administrator-level identity. See [Admin / CI permission boundary](#admin--ci-permission-boundary) below. CI after provisioning can plan the whole stack and manage only the EKS cluster/node group, ECR repository and control-plane log group.
 
@@ -228,7 +226,7 @@ The deploy identity has no IAM write access and no EC2/VPC write access. It can 
 | EC2/VPC (VPC, subnets, IGW, NAT, EIPs, routes, security groups, launch templates, tags) | full, via the `<project>-admin-ec2-vpc` policy or equivalent | `ec2:Describe*` only |
 | EKS cluster / node group | full | create/update/delete, scoped to `<project>-*` |
 | ECR repository, control-plane log group | full | manage, scoped to the one repo / `/aws/eks/<project>-*` |
-| State bucket | bootstrap | read/write only the state object and its lock |
+| State bucket | created manually (Console) | read/write only the state object and its lock |
 | `iam:PassRole` | any | exact cluster-role and node-role ARNs, only to EKS |
 
 Consequences:
@@ -261,4 +259,4 @@ terraform plan -destroy                          # review first
 terraform destroy                                # only when you are sure
 ```
 
-ECR has `force_delete = false`: delete images in the repository first. The state bucket has `prevent_destroy`; to remove it, empty all object versions, delete the `prevent_destroy` block, then destroy in `bootstrap/`.
+ECR has `force_delete = false`: delete images in the repository first. The state bucket was created manually and is not managed by Terraform: delete it in the AWS Console only after the infrastructure that uses it is gone (empty all object versions first).

@@ -54,8 +54,10 @@ env:
   AWS_REGION: us-east-1
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
-  # Non-secret configuration (repository variables, not secrets). tfvars files are not committed.
-  TF_VAR_tfstate_bucket_name: ${{ vars.TFSTATE_BUCKET_NAME }}
+  # Existing state bucket, created manually in the AWS Console. It must match terraform/backend.tf
+  # (the backend reads its bucket from there, so `terraform init` needs no extra arguments).
+  TF_VAR_tfstate_bucket_name: moh-terraform-state-2026-unique
+  # Non-secret configuration (repository variable, not a secret). tfvars files are not committed.
   TF_VAR_public_access_cidrs: ${{ vars.PUBLIC_ACCESS_CIDRS }} # JSON list, e.g. ["203.0.113.10/32"]; never 0.0.0.0/0
 
 jobs:
@@ -104,7 +106,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init (S3 backend)
-        run: terraform -chdir="$TF_WORKING_DIR" init -backend-config="bucket=${TF_VAR_tfstate_bucket_name}"
+        run: terraform -chdir="$TF_WORKING_DIR" init
 
   # ===========================================================================
   # Job 2: validate
@@ -198,7 +200,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init (S3 backend)
-        run: terraform -chdir="$TF_WORKING_DIR" init -backend-config="bucket=${TF_VAR_tfstate_bucket_name}"
+        run: terraform -chdir="$TF_WORKING_DIR" init
 
       - name: Terraform Plan
         id: plan
@@ -341,7 +343,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Terraform Init (S3 backend)
-        run: terraform -chdir="$TF_WORKING_DIR" init -backend-config="bucket=${TF_VAR_tfstate_bucket_name}"
+        run: terraform -chdir="$TF_WORKING_DIR" init
 
       - name: Download plan artifact
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

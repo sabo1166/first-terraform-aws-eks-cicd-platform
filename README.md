@@ -132,9 +132,9 @@ The project was organized and implemented through the following stages:
 
 Created a modular Terraform project structure to separate infrastructure resources and improve maintainability.
 
-### Step 2 — Terraform Bootstrap
+### Step 2 — Remote State Bucket
 
-Prepared the S3 backend infrastructure for remote Terraform state management.
+Prepared a Terraform bootstrap configuration for the S3 state bucket. The bucket itself (`moh-terraform-state-2026-unique`, us-east-1) was created manually through the AWS Console, so the bootstrap configuration is kept for reference only and is not run.
 
 ### Step 3 — AWS Networking
 
@@ -241,7 +241,7 @@ first-terraform-aws-eks-cicd-platform/
 │   └── OPERATIONS.md
 │
 ├── terraform/
-│   ├── bootstrap/
+│   ├── bootstrap/            (reference only: the state bucket was created manually)
 │   │   ├── .terraform.lock.hcl
 │   │   ├── versions.tf
 │   │   ├── variables.tf
@@ -321,45 +321,28 @@ Verify your AWS identity:
 aws sts get-caller-identity
 ```
 
-### 3. Initialize Terraform Bootstrap
+### 3. State Bucket (already created)
+
+The S3 bucket for Terraform remote state, `moh-terraform-state-2026-unique` in `us-east-1`, was **created manually through the AWS Console**. Terraform only uses it as the backend and never creates it, so `terraform/bootstrap/` is not needed for this bucket. Do not run it.
+
+In the AWS Console, confirm the bucket has **Versioning enabled** (new buckets have it off), default encryption on, and **Block all public access** on.
+
+### 4. Configure Variables
 
 ```bash
-cd terraform/bootstrap
-
-terraform init
-terraform fmt -check
-terraform validate
+cd terraform
+cp terraform.tfvars.example terraform.tfvars  # set public_access_cidrs
 ```
 
-Review the bootstrap plan before creating any AWS resources (the bucket name must be globally unique):
-
-```bash
-terraform plan -var "state_bucket_name=<globally-unique-bucket-name>"
-```
-
-Creating the state bucket is a real AWS change and is done only after reviewing that plan:
-
-```bash
-terraform apply -var "state_bucket_name=<globally-unique-bucket-name>"
-```
-
-### 4. Configure Remote Backend
-
-After the backend bucket has been created, configure the backend settings using the provided example files.
-
-```bash
-cd ../
-cp backend.hcl.example backend.hcl            # set bucket to your state bucket
-cp terraform.tfvars.example terraform.tfvars  # set public_access_cidrs and tfstate_bucket_name
-```
-
-`public_access_cidrs` is required: it lists who may reach the public EKS API endpoint (for example your IP as `x.x.x.x/32`), and `0.0.0.0/0` is rejected. Both generated files are git-ignored.
+`public_access_cidrs` is required: it lists who may reach the public EKS API endpoint (for example your IP as `x.x.x.x/32`), and `0.0.0.0/0` is rejected. The generated file is git-ignored. The state bucket name is already set in `backend.tf` (and is the default of `tfstate_bucket_name`), so no `backend.hcl` is needed.
 
 ### 5. Initialize Main Terraform Configuration
 
 ```bash
-terraform init -backend-config=backend.hcl
+terraform init
 ```
+
+`init` connects to the existing bucket. No local state exists, so nothing needs to be migrated; if `init` ever asks to copy existing state, stop and check before answering.
 
 ### 6. Validate Infrastructure
 

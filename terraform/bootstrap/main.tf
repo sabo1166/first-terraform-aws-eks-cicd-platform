@@ -1,3 +1,10 @@
+# NOT USED: the Terraform state bucket (moh-terraform-state-2026-unique, us-east-1) was created
+# manually in the AWS Console, so this configuration is NOT needed and must NOT be run
+# (it would try to create a bucket that already exists). It is kept only as a record of
+# the intended bucket settings (versioning, AES-256, public access block,
+# bucket-owner-enforced ownership, TLS-only policy, no force-destroy) and as a starting
+# point if a replacement bucket is ever needed. Its state would stay local.
+
 provider "aws" {
   region = var.aws_region
 

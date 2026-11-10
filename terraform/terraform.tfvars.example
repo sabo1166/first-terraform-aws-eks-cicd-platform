@@ -4,8 +4,9 @@
 # Find your IP, then use /32:  curl https://checkip.amazonaws.com
 public_access_cidrs = ["203.0.113.10/32"]
 
-# REQUIRED: bucket created by ./bootstrap.
-tfstate_bucket_name = "REPLACE-WITH-YOUR-STATE-BUCKET-NAME"
+# The state bucket already exists (created manually in the AWS Console) and defaults to
+# "moh-terraform-state-2026-unique", the same bucket as terraform/backend.tf. Set this only if the bucket changes.
+# tfstate_bucket_name = "moh-terraform-state-2026-unique"
 
 # Enables the OIDC roles used by .github/workflows/eks-cicd.yml (leave empty to skip):
 # github_repository = "your-github-user-or-org/your-repo"
