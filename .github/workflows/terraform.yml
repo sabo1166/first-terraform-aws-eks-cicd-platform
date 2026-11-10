@@ -6,21 +6,27 @@
 #   init      checkout, AWS identity check, Terraform setup, backend initialisation
 #   validate  terraform fmt -check, terraform validate (no AWS credentials needed)
 #   plan      terraform plan -out=tfplan, read-only preflight for already-existing
-#             resources, GPG-encrypted plan uploaded as an artifact
+#             resources, saved plan uploaded as an artifact (1-day retention)
 #   apply     runs in the `production` environment: GitHub holds the job until a
 #             required reviewer approves, BEFORE any apply step runs. Downloads the
-#             EXACT encrypted plan, verifies its SHA-256, decrypts it, applies it
-#             (no new plan), then prints the Terraform outputs.
+#             EXACT saved plan, verifies its SHA-256, applies it (no new plan), then
+#             prints the Terraform outputs.
+#
+# SECURITY NOTE: the plan artifact is NOT encrypted. A saved Terraform plan can contain
+# sensitive values in plain text, and anyone who can read this repository's Actions
+# artifacts can download it during its 1-day retention. Keep the repository private and
+# limit who has read access. The SHA-256 check only detects tampering; it does not hide
+# the contents.
 #
 # Each job runs on a fresh GitHub-hosted runner, so every job that needs Terraform
 # checks out the code, installs Terraform and initialises on its own. Nothing is
-# shared between jobs except job outputs and the encrypted plan artifact.
+# shared between jobs except job outputs and the saved plan artifact.
 #
 # Only `workflow_dispatch`: nothing here runs on push or pull_request.
 # Setup (secrets, variables, GitHub Environment): see docs/OPERATIONS.md "Terraform workflow".
 #
 # NO RESOURCE-TYPE ALLOW-LIST: the plan job no longer filters the plan by resource type, so
-# any plan with changes is encrypted, uploaded and offered for approval. What CI can actually
+# any plan with changes is uploaded and offered for approval. What CI can actually
 # change is limited only by the IAM permissions of the CI identity (an apply that needs a
 # permission it lacks fails partway). The human review of the plan in the `production`
 # approval is the control that decides what is applied.
@@ -28,7 +34,7 @@
 # Remaining automatic checks:
 #   * plan job:  read-only preflight; fails if a resource the plan would create already
 #                exists in AWS (it never imports and never touches Terraform state).
-#   * apply job: re-checks the decrypted plan right before apply and REFUSES it if it
+#   * apply job: re-checks the saved plan right before apply and REFUSES it if it
 #                deletes or replaces any resource, or creates an EKS cluster with
 #                bootstrap_cluster_creator_admin_permissions != false (that would make the CI
 #                identity Kubernetes cluster-admin).
@@ -162,7 +168,7 @@ jobs:
   # ===========================================================================
   # Job 3: plan
   # Produces the saved plan, runs the read-only existing-resource preflight, and
-  # uploads ONLY an encrypted copy. The plain plan never leaves this runner.
+  # uploads the saved plan (UNENCRYPTED, 1-day retention) with its SHA-256 recorded.
   # ===========================================================================
   plan:
     name: 3 - Terraform Plan
@@ -172,8 +178,8 @@ jobs:
     outputs:
       sha: ${{ steps.commit.outputs.sha }}
       has_changes: ${{ steps.plan.outputs.has_changes }}
-      plan_sha256: ${{ steps.encrypt.outputs.plan_sha256 }}
-      artifact_name: ${{ steps.encrypt.outputs.artifact_name }}
+      plan_sha256: ${{ steps.checksum.outputs.plan_sha256 }}
+      artifact_name: ${{ steps.checksum.outputs.artifact_name }}
     steps:
       - name: Checkout repository (same commit)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -242,42 +248,38 @@ jobs:
           trap 'rm -f "$RUNNER_TEMP/plan.json"' EXIT
           python3 -I .github/scripts/preflight_existing_resources.py "$RUNNER_TEMP/plan.json"
 
-      - name: Encrypt plan
-        # The plan file can contain secrets in plain text and anyone with read access
-        # to the repository can download artifacts, so only an encrypted copy is uploaded.
-        id: encrypt
+      - name: Checksum plan
+        # The saved plan is uploaded UNENCRYPTED and can contain sensitive values in plain
+        # text. Anyone who can read this repository's Actions artifacts can download it
+        # during its 1-day retention. Only its SHA-256 is recorded, and the plan contents
+        # are never printed.
+        id: checksum
         if: steps.plan.outputs.has_changes == 'true'
-        env:
-          TF_PLAN_ENCRYPTION_KEY: ${{ secrets.TF_PLAN_ENCRYPTION_KEY }}
         run: |
           set -euo pipefail
-          [ -n "$TF_PLAN_ENCRYPTION_KEY" ] || { echo "::error::secret TF_PLAN_ENCRYPTION_KEY is not set"; exit 1; }
           cd "$TF_WORKING_DIR"
-          printf '%s' "$TF_PLAN_ENCRYPTION_KEY" | gpg --batch --yes --no-tty --pinentry-mode loopback \
-            --passphrase-fd 0 --symmetric --cipher-algo AES256 --output tfplan.gpg tfplan
-          rm -f tfplan
-          echo "plan_sha256=$(sha256sum tfplan.gpg | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "plan_sha256=$(sha256sum tfplan | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "artifact_name=tfplan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
       - name: Upload plan artifact
         if: steps.plan.outputs.has_changes == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ steps.encrypt.outputs.artifact_name }}
-          path: ${{ env.TF_WORKING_DIR }}/tfplan.gpg
+          name: ${{ steps.checksum.outputs.artifact_name }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
           retention-days: 1
           if-no-files-found: error
 
       - name: Remove local plan files
         if: always()
-        run: rm -f "$TF_WORKING_DIR/tfplan" "$TF_WORKING_DIR/tfplan.gpg" "$RUNNER_TEMP/plan.json"
+        run: rm -f "$TF_WORKING_DIR/tfplan" "$RUNNER_TEMP/plan.json"
 
   # ===========================================================================
   # Job 4: apply (manual approval)
   # `environment: production` makes GitHub hold this job until a required
   # reviewer approves; no step below runs before that. It runs only if every
   # earlier job succeeded, the plan has changes, and the run is on main. Before
-  # applying it re-checks the decrypted plan (no deletes/replacements, no CI cluster-admin).
+  # applying it re-checks the saved plan (no deletes/replacements, no CI cluster-admin).
   # ===========================================================================
   apply:
     name: 4 - Terraform Apply
@@ -332,23 +334,19 @@ jobs:
           name: ${{ env.PLAN_ARTIFACT }}
           path: ${{ env.TF_WORKING_DIR }}
 
-      - name: Verify and decrypt plan
+      - name: Verify plan checksum
         # The checksum comes from the plan job's output, so a swapped or altered
-        # artifact is rejected before it is decrypted or applied.
-        env:
-          TF_PLAN_ENCRYPTION_KEY: ${{ secrets.TF_PLAN_ENCRYPTION_KEY }}
+        # artifact is rejected before it is inspected or applied. The plan is not
+        # encrypted and its contents are never printed.
         run: |
           set -euo pipefail
           cd "$TF_WORKING_DIR"
-          echo "${PLAN_SHA256}  tfplan.gpg" | sha256sum --check --status \
-            || { echo "::error::plan artifact checksum mismatch"; exit 1; }
-          printf '%s' "$TF_PLAN_ENCRYPTION_KEY" | gpg --batch --yes --no-tty --pinentry-mode loopback \
-            --passphrase-fd 0 --decrypt --output tfplan tfplan.gpg
-          rm -f tfplan.gpg
+          echo "${PLAN_SHA256}  tfplan" | sha256sum --check --status \
+            || { rm -f tfplan; echo "::error::plan artifact checksum mismatch"; exit 1; }
 
-      - name: Delete guard (re-check the decrypted plan)
-        # Defence in depth: the plan job already blocks deletions, but the apply job
-        # re-checks the exact file it is about to apply and refuses on any delete/replace.
+      - name: Delete guard (re-check the saved plan)
+        # The apply job re-checks the exact file it is about to apply and refuses on any
+        # delete/replace (the plan job no longer filters plans, so this is the guard).
         run: |
           set -euo pipefail
           terraform -chdir="$TF_WORKING_DIR" show -json tfplan > "$RUNNER_TEMP/plan.json"
@@ -384,4 +382,4 @@ jobs:
 
       - name: Remove local plan files
         if: always()
-        run: rm -f "$TF_WORKING_DIR/tfplan" "$TF_WORKING_DIR/tfplan.gpg" "$RUNNER_TEMP/plan.json"
+        run: rm -f "$TF_WORKING_DIR/tfplan" "$RUNNER_TEMP/plan.json"

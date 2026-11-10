@@ -185,7 +185,7 @@ Terraform Validate
 Terraform Plan
        |
        v
-Encrypted Plan Artifact
+Saved Plan Artifact (unencrypted, 1-day retention)
        |
        v
 Production Environment Approval
@@ -384,7 +384,7 @@ The infrastructure configuration incorporates several security practices:
 - Restricted EKS API endpoint configuration.
 - IAM roles and scoped policies.
 - Optional GitHub OIDC configuration (prepared in Terraform, not active).
-- Encrypted Terraform plan artifact.
+- Terraform plan artifact verified by SHA-256 (the artifact is **not encrypted** and may contain sensitive values; keep the repository private, see `docs/OPERATIONS.md`).
 - S3 public access blocking.
 - TLS-only S3 access.
 - KMS encryption integration.
