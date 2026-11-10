@@ -45,107 +45,27 @@ The project provides a practical environment for learning AWS cloud infrastructu
 ## 🏗️ Architecture
 
 <p align="center">
-  <b>AWS EKS — Multi-AZ Infrastructure Architecture</b>
+  <a href="docs/architecture.gif"><img src="docs/architecture.gif" alt="AWS EKS multi-AZ infrastructure and CI/CD architecture: GitHub Actions and Terraform, S3 state, ECR, KMS, a two-AZ VPC with public and private subnets, NAT and Internet gateways, EKS control plane and managed node group" width="100%"></a>
 </p>
 
-```mermaid
-%%{init: {'theme':'base','themeVariables':{'fontFamily':'Arial','fontSize':'14px','lineColor':'#64748b','primaryTextColor':'#1e293b'},'flowchart':{'curve':'basis','nodeSpacing':35,'rankSpacing':55}}}%%
-flowchart TB
+<p align="center">
+  <a href="docs/architecture.gif">Open full-size GIF</a>
+</p>
 
-    DEV(["👨‍💻 Developer"])
-    GH["GitHub Repository"]
-    GHA["GitHub Actions<br/>Terraform & Application CI/CD"]
-    OIDC["GitHub OIDC<br/>(prepared, not active)"]
-    IAM["AWS IAM Roles"]
-
-    DEV --> GH
-    GH --> GHA
-    GHA --> OIDC
-    OIDC --> IAM
-
-    subgraph AWS["☁️ AWS CLOUD — us-east-1"]
-      direction TB
-
-      S3[("Amazon S3<br/>Terraform Remote State")]
-      ECR[("Amazon ECR<br/>Private Image Registry")]
-      KMS["AWS KMS<br/>Encryption"]
-
-      subgraph VPC["🌐 VPC — 10.0.0.0/16"]
-        direction TB
-
-        IGW["Internet Gateway"]
-
-        subgraph AZ1["Availability Zone 1"]
-          direction TB
-          PUB1["Public Subnet"]
-          NAT["NAT Gateway"]
-          PRIV1["Private Subnet"]
-          NODE1["EKS Worker Node 1"]
-          PUB1 --> NAT
-          PRIV1 --> NODE1
-        end
-
-        subgraph AZ2["Availability Zone 2"]
-          direction TB
-          PUB2["Public Subnet"]
-          PRIV2["Private Subnet"]
-          NODE2["EKS Worker Node 2"]
-          PRIV2 --> NODE2
-        end
-
-        EKS["Amazon EKS<br/>Managed Control Plane<br/>(ENIs in private subnets)"]
-
-        IGW --> PUB1
-        IGW --> PUB2
-        NAT --> PRIV1
-        NAT -. "Shared outbound route" .-> PRIV2
-        EKS --> NODE1
-        EKS --> NODE2
-      end
-    end
-
-    IAM --> EKS
-    IAM --> ECR
-    GHA -. "IAM user keys (Terraform workflow)" .-> S3
-    NODE1 --> ECR
-    NODE2 --> ECR
-    EKS --> KMS
-
-    classDef developer fill:#e0f2fe,stroke:#0284c7,color:#075985,stroke-width:2px;
-    classDef github fill:#f1f5f9,stroke:#475569,color:#0f172a,stroke-width:2px;
-    classDef identity fill:#fef3c7,stroke:#d97706,color:#92400e,stroke-width:2px;
-    classDef network fill:#dbeafe,stroke:#2563eb,color:#1e40af,stroke-width:2px;
-    classDef private fill:#dcfce7,stroke:#16a34a,color:#166534,stroke-width:2px;
-    classDef kubernetes fill:#ede9fe,stroke:#7c3aed,color:#5b21b6,stroke-width:2px;
-    classDef storage fill:#ffedd5,stroke:#ea580c,color:#9a3412,stroke-width:2px;
-    classDef security fill:#fce7f3,stroke:#db2777,color:#9d174d,stroke-width:2px;
-
-    class DEV developer;
-    class GH,GHA github;
-    class OIDC,IAM identity;
-    class IGW,PUB1,PUB2 network;
-    class PRIV1,PRIV2,NAT private;
-    class EKS,NODE1,NODE2 kubernetes;
-    class S3,ECR storage;
-    class KMS security;
-
-    style AWS fill:#f8fafc,stroke:#64748b,stroke-width:3px
-    style VPC fill:#eff6ff,stroke:#2563eb,stroke-width:2px
-    style AZ1 fill:#f0f9ff,stroke:#0ea5e9,stroke-width:2px
-    style AZ2 fill:#f0fdf4,stroke:#22c55e,stroke-width:2px
-```
+> The diagram shows what the Terraform in this repository **defines**. Nothing has been deployed or verified in AWS yet, GitHub OIDC is prepared but **not active** (Terraform CI uses IAM user access keys), and no Kubernetes workloads exist.
 
 ### 🎨 Architecture Legend
 
-| Color | Component |
+| Marker | Meaning |
 |---|---|
-| 🔵 Blue | Networking & VPC |
-| 🟢 Green | Private Subnets |
-| 🟣 Purple | Kubernetes & EKS |
-| 🟠 Orange | AWS Storage Services |
-| 🩷 Pink | Encryption & Security |
-| 🟡 Yellow | IAM & Identity |
-| ⚪ Grey | GitHub & CI/CD |
+| Cyan flow | Git push / CI trigger |
+| Orange flow | Terraform provisioning and remote state |
+| Green flow | Node egress through NAT Gateway and Internet Gateway |
+| Purple flow | EKS control plane ⇄ worker nodes |
+| Blue flow | Container image delivery (ECR → nodes) |
+| Solid box | Defined in Terraform |
+| Amber dashed | Prepared, not active (GitHub OIDC) |
+| Grey dashed | Not deployed (Kubernetes workloads) |
 
 ### Key Architecture Features
 
@@ -319,10 +239,12 @@ first-terraform-aws-eks-cicd-platform/
 │       └── eks-cicd.yml
 │
 ├── docs/
+│   ├── architecture.gif   (animated architecture diagram)
 │   └── OPERATIONS.md
 │
 ├── terraform/
 │   ├── bootstrap/
+│   │   ├── .terraform.lock.hcl
 │   │   ├── versions.tf
 │   │   ├── variables.tf
 │   │   ├── main.tf
@@ -330,10 +252,30 @@ first-terraform-aws-eks-cicd-platform/
 │   │
 │   ├── modules/
 │   │   ├── vpc/
+│   │   │   ├── main.tf
+│   │   │   ├── variables.tf
+│   │   │   └── outputs.tf
 │   │   ├── ecr/
+│   │   │   ├── main.tf
+│   │   │   ├── variables.tf
+│   │   │   └── outputs.tf
 │   │   ├── eks/
+│   │   │   ├── main.tf
+│   │   │   ├── variables.tf
+│   │   │   └── outputs.tf
 │   │   └── iam/
+│   │       ├── main.tf
+│   │       ├── variables.tf
+│   │       ├── outputs.tf
+│   │       ├── eks_roles.tf
+│   │       ├── eks_secrets_kms.tf
+│   │       ├── admin_policy.tf
+│   │       ├── github_actions.tf
+│   │       ├── github_deploy_policy.tf
+│   │       ├── github_oidc.tf
+│   │       └── github_oidc.tf.example
 │   │
+│   ├── .terraform.lock.hcl
 │   ├── versions.tf
 │   ├── providers.tf
 │   ├── backend.tf
@@ -345,7 +287,7 @@ first-terraform-aws-eks-cicd-platform/
 │
 ├── .gitignore
 └── README.md
-```
+``````
 
 ## 🚀 Deployment Guide
 

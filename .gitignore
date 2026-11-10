@@ -22,8 +22,19 @@ terraform.rc
 backend.hcl
 !backend.hcl.example
 
-# Credentials / secrets
+# Credentials / secrets / local environment
 .env
+.env.*
+!.env.example
 *.pem
 *.key
 .aws/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# IDE and local tools
+.vscode/
+.idea/
+.serena/
