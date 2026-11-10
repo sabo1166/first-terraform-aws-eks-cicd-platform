@@ -15,33 +15,6 @@
 
 ---
 
-## 📌 Project Overview
-
-This project demonstrates the design and implementation of an AWS Elastic Kubernetes Service (EKS) infrastructure platform using **Terraform** and **GitHub Actions**.
-
-The infrastructure is designed around a modular Infrastructure as Code approach, with a focus on cloud networking, Kubernetes infrastructure, IAM permissions, container image management, remote Terraform state, and automated infrastructure workflows.
-
-The project provides a practical environment for learning AWS cloud infrastructure and DevOps engineering concepts.
-
-> 📖 Detailed setup, permission and workflow documentation: **[docs/OPERATIONS.md](docs/OPERATIONS.md)**
-
-## 🛠️ Tools & Technologies
-
-| Category | Technology | Purpose |
-|---|---|---|
-| Cloud Provider | AWS | Cloud infrastructure |
-| Infrastructure as Code | Terraform | Provisioning and managing infrastructure |
-| Container Orchestration | Amazon EKS | Managed Kubernetes cluster |
-| Container Registry | Amazon ECR | Private container image storage |
-| Networking | Amazon VPC | Public and private network architecture |
-| Identity & Access | AWS IAM | Roles and permissions |
-| Encryption | AWS KMS | Encryption key management |
-| CI/CD | GitHub Actions | Automated workflows |
-| Authentication | AWS Access Keys | AWS authentication using IAM access key credentials |
-| Remote State | Amazon S3 | Terraform state storage |
-| State Locking | Terraform S3 Lockfile | State concurrency protection |
-| Version Control | Git & GitHub | Source code management |
-
 ## 🏗️ Architecture
 
 <p align="center">
@@ -74,6 +47,33 @@ The project provides a practical environment for learning AWS cloud infrastructu
 - Private ECR image registry.
 - Encrypted Terraform remote state.
 - KMS-based encryption integration.
+
+## 📌 Project Overview
+
+This project demonstrates the design and implementation of an AWS Elastic Kubernetes Service (EKS) infrastructure platform using **Terraform** and **GitHub Actions**.
+
+The infrastructure is designed around a modular Infrastructure as Code approach, with a focus on cloud networking, Kubernetes infrastructure, IAM permissions, container image management, remote Terraform state, and automated infrastructure workflows.
+
+The project provides a practical environment for learning AWS cloud infrastructure and DevOps engineering concepts.
+
+> 📖 Detailed setup, permission and workflow documentation: **[docs/OPERATIONS.md](docs/OPERATIONS.md)**
+
+## 🛠️ Tools & Technologies
+
+| Category | Technology | Purpose |
+|---|---|---|
+| Cloud Provider | AWS | Cloud infrastructure |
+| Infrastructure as Code | Terraform | Provisioning and managing infrastructure |
+| Container Orchestration | Amazon EKS | Managed Kubernetes cluster |
+| Container Registry | Amazon ECR | Private container image storage |
+| Networking | Amazon VPC | Public and private network architecture |
+| Identity & Access | AWS IAM | Roles and permissions |
+| Encryption | AWS KMS | Encryption key management |
+| CI/CD | GitHub Actions | Automated workflows |
+| Authentication | AWS Access Keys | AWS authentication using IAM access key credentials |
+| Remote State | Amazon S3 | Terraform state storage |
+| State Locking | Terraform S3 Lockfile | State concurrency protection |
+| Version Control | Git & GitHub | Source code management |
 
 ## ⚙️ Infrastructure Components
 
