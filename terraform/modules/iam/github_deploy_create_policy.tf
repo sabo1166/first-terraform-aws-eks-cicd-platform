@@ -12,6 +12,9 @@
 #     EC2/VPC policy and the permissions boundary are admin-only: they are explicitly
 #     denied below (the workflow has no resource-type allow-list, so IAM is the control).
 #     Otherwise CI could edit its own policy or attach AdministratorAccess to itself.
+#     NOTE: an administrator MAY attach AdministratorAccess to the CI user
+#     (grant_ci_administrator_access, github_actions.tf). The explicit Deny statements
+#     below still win over it; they are not removed.
 #   * Everything is limited to var.aws_region and, where AWS supports it, to resources
 #     tagged Project=<project_name> (the provider's default_tags put that tag on every
 #     resource Terraform creates).

@@ -229,6 +229,15 @@ These are separate from the Terraform-management identity (`modules/iam/github_a
 
 ## AWS permissions
 
+> **WARNING: the Terraform CI identity has full AWS administrative permissions.**
+> The IAM user `eks-cicd-platform-github-actions` (the identity behind the `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` repository secrets) has the AWS-managed **`AdministratorAccess`** policy attached (`grant_ci_administrator_access = true`, `modules/iam/github_actions.tf`). This was an explicit decision by the repository owner. It means:
+> - Anyone who obtains the CI access keys can do **anything** in the whole AWS account (all services, all regions, data, billing, IAM), not only this project.
+> - Anyone who can change the workflow, the Terraform code or the scripts that run with those keys (a push to `main`, an approved workflow change, a compromised dependency or action) can do the same. The workflow guards (delete re-check, cluster-admin check, preflight) are code in this repository and are **not** a security boundary against someone who can edit the repository.
+> - The `production` environment approval is the main remaining human control. It only works if **Required reviewers** are configured in GitHub, and the plan artifact is unencrypted (see below), so keep the repository private and restrict who can write to it and approve deployments.
+> - The access keys are long-lived static keys stored in GitHub. Rotate them by hand, never put them anywhere else, and prefer moving to OIDC with a role (and removing the administrator attachment) as soon as practical. Setting `grant_ci_administrator_access = false` and applying removes the attachment.
+>
+> **What still holds:** the explicit `Deny` statements in `github_deploy_create_policy.tf` are kept. An explicit deny overrides an allow, so even with `AdministratorAccess` the CI user still cannot change its own user, the two CI policies, the admin EC2/VPC policy or the permissions boundary, cannot create or modify its own access keys, and cannot remove the permissions boundary from the EKS roles. The workflow's EKS cluster-admin check also still refuses a plan that creates the cluster with `bootstrap_cluster_creator_admin_permissions` not `false`. **Only an administrator can apply the administrator attachment** (CI is denied `iam:AttachUserPolicy` on itself); until an administrator applies it, the live permissions are unchanged. The detailed per-service scoping below describes the two CI policies, which stay attached but are now superseded by the administrator policy except for the denies.
+
 **For the state bucket:** it was created manually in the AWS Console, so no Terraform permissions are needed to create it. `terraform/bootstrap` is not run.
 
 **For the admin-managed layer** (CI user, both CI policies, the permissions boundary, the admin EC2/VPC policy): an administrator-level identity, applied once. CI can never change these. See [Admin / CI permission boundary](#admin--ci-permission-boundary) below.
@@ -274,14 +283,14 @@ The deploy identity can still call EKS/ECR/log-group delete APIs directly (the I
 | State bucket | created manually (Console) | read/write only the state object and its lock |
 | `iam:PassRole` | any | exact cluster-role and node-role ARNs, only to EKS |
 
-What the CI user's IAM permissions cover (this is the only technical limit now that the workflow allow-list is gone; see [AWS permissions](#aws-permissions)):
+What the CI user's two scoped IAM policies cover. With the administrator attachment applied these scoped permissions are superseded (only the explicit denies still limit CI); they describe the intended least-privilege layout if `grant_ci_administrator_access` is set to `false`:
 - **Create and update:** EKS cluster, node group, access entries and policy associations, ECR repository and lifecycle policy, the control-plane log group, the node launch template.
 - **Create only:** VPC, subnets, internet gateway, NAT gateway, Elastic IP, route tables and associations, the default security group lock-down, the KMS key and alias, and the two EKS IAM roles (with the permissions boundary).
 - **Not possible for CI:** creating or changing the CI user, any IAM policy, the boundary, the OIDC provider or OIDC roles; key policies; any delete in EC2/IAM/KMS.
 
 Consequences:
 
-- `modules/iam/admin_policy.tf` defines the admin EC2/VPC permission set for humans (`admin_ec2_vpc_policy_arn` output). **Terraform does not attach it to anyone.** Attach it (or `AdministratorAccess`) to your admin role or group yourself. Never attach it to the CI user.
+- `modules/iam/admin_policy.tf` defines the admin EC2/VPC permission set for humans (`admin_ec2_vpc_policy_arn` output). **Terraform does not attach it to anyone.** Attach it (or `AdministratorAccess`) to your human admin role or group yourself. Do not attach this policy to the CI user: CI's administrator access comes from the separate, explicit `grant_ci_administrator_access` attachment described in the warning under [AWS permissions](#aws-permissions).
 - Changing an existing VPC/IAM/KMS resource (anything other than create) is an administrator job. The workflow no longer filters these out, so an approved plan containing them fails partway at apply; reject such plans at the approval.
 - **Kubernetes cluster-admin and CI:** with the current setting (`bootstrap_cluster_creator_admin_permissions = true`), the apply job's re-check **refuses** any plan that creates the EKS cluster, so the cluster must be created by an administrator until the setting is changed. See the proposal in [Initial creation through CI](#initial-creation-through-ci).
 

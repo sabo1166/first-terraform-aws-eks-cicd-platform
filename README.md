@@ -398,6 +398,7 @@ GitHub Environment protection rules and AWS permissions must be configured and v
 - The Terraform workflow uses long-lived IAM user access keys stored as repository secrets; migrating it to OIDC is planned.
 - The `production` approval gate exists only once the GitHub Environment is configured with required reviewers.
 - The Terraform CI identity can still manage EKS cluster access settings.
+- **The Terraform CI IAM user has the AWS-managed `AdministratorAccess` policy attached** (`grant_ci_administrator_access = true`, once an administrator applies it). Anyone with its access keys, or who can change the workflow or Terraform code, has full administrative control of the AWS account. The explicit self-protection denies and the `production` manual approval remain; see `docs/OPERATIONS.md` "AWS permissions".
 
 ## 💰 Cost Considerations
 

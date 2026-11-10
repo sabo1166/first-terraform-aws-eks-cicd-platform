@@ -52,6 +52,12 @@ variable "github_oidc_provider_arn" {
   default     = null
 }
 
+variable "grant_ci_administrator_access" {
+  description = "Attach the AWS-managed AdministratorAccess policy to the GitHub Actions IAM user (full AWS administrative access for CI). The explicit self-protection Deny statements in the CI policies still apply."
+  type        = bool
+  default     = false
+}
+
 variable "github_actions_user_name" {
   description = "Override for the GitHub Actions IAM user name. Defaults to '<project_name>-github-actions'."
   type        = string

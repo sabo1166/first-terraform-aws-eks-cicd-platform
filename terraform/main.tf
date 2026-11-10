@@ -35,6 +35,8 @@ module "iam" {
 
   github_repository        = var.github_repository
   github_oidc_provider_arn = var.github_oidc_provider_arn
+
+  grant_ci_administrator_access = var.grant_ci_administrator_access
 }
 
 module "ecr" {

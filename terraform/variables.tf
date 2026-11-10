@@ -141,6 +141,12 @@ variable "tfstate_key" {
   default     = "eks-cicd-platform/terraform.tfstate"
 }
 
+variable "grant_ci_administrator_access" {
+  description = "Attach the AWS-managed AdministratorAccess policy to the GitHub Actions IAM user. WARNING: gives CI (and anyone with its access keys or the ability to change the workflow) full administrative access to the AWS account. The explicit self-protection Deny statements still apply. Set to false to remove it."
+  type        = bool
+  default     = true
+}
+
 variable "additional_access_entries" {
   description = "Extra IAM principals to grant EKS cluster access (map key = label). policy_arn e.g. arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy. Optional namespaces limits the policy to those namespaces."
   type = map(object({
