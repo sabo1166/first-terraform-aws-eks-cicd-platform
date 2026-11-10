@@ -139,7 +139,7 @@ Safeguards: runs are serialized (`concurrency: terraform-infra`, never cancelled
 
 **Delete guard.** CI never applies a plan that deletes or replaces anything. The plan job inspects the saved plan (`terraform show -json`) and, if any resource has a `delete` action (delete, delete+create, create+delete), it uploads nothing, offers no approval, and lists the blocked resources and their actions in the run summary. The apply job also re-checks the decrypted plan right before `terraform apply` and fails if it finds any delete or replace, so the guard cannot be bypassed by the apply job. Deletions and replacements must be reviewed and applied by an administrator.
 
-**Important: what CI may apply.** The CI identity has no IAM, KMS or EC2/VPC write permissions (Admin-only). The plan job checks the plan against an allow-list (EKS cluster/node group/access entries, ECR repository + lifecycle policy, the control-plane log group). If the plan changes anything else, it is still shown for review but is **not** uploaded and **no apply is offered**: apply those changes as an administrator. This means the first provisioning of the stack must be done by an admin, not by this workflow.
+**Important: what CI may apply.** The plan job checks the plan against an allow-list (full list and reasons under [Admin / CI permission boundary](#admin--ci-permission-boundary)): create/update for EKS, ECR, the log group and the launch template; create-only for the VPC resources, the KMS key/alias and the two EKS IAM roles. The CI IAM user, its policies and the permissions boundary are never allowed. If the plan contains anything else, it is still shown for review but is **not** uploaded and **no apply is offered**: apply those changes as an administrator. The first provisioning needs a one-time admin step first, see [Initial creation through CI](#initial-creation-through-ci).
 
 ### Root cause of the "S3 bucket ... does not exist" init failure
 `terraform init` failed with `S3 bucket "moh-terraform-state-2026-unique" does not exist.` The real state bucket is `moh-terraform-state-2026-uniq`, but the repository hardcoded the wrong name (`...-unique`) in `terraform/backend.tf`, the workflow, variable defaults and docs. The backend block cannot use variables and the workflow does not read a `TFSTATE_BUCKET_NAME` variable, so setting that GitHub variable had no effect. The name is now `moh-terraform-state-2026-uniq` everywhere. No state was migrated: the old name never existed as a bucket.
@@ -231,39 +231,78 @@ These are separate from the Terraform-management identity (`modules/iam/github_a
 
 **For the state bucket:** it was created manually in the AWS Console, so no Terraform permissions are needed to create it. `terraform/bootstrap` is not run.
 
-**For the first apply of the main stack, and any change to IAM, KMS, or EC2/VPC resources:** use an administrator-level identity. See [Admin / CI permission boundary](#admin--ci-permission-boundary) below. CI after provisioning can plan the whole stack and manage only the EKS cluster/node group, ECR repository and control-plane log group.
+**For the admin-managed layer** (CI user, both CI policies, the permissions boundary, the admin EC2/VPC policy): an administrator-level identity, applied once. CI can never change these. See [Admin / CI permission boundary](#admin--ci-permission-boundary) below.
 
-**For the GitHub Actions user** (policy `<project>-github-actions-deploy`, defined in `modules/iam/github_deploy_policy.tf`):
+**For the first creation of the stack:** CI can now create the network, the two EKS roles, the KMS key and the node launch template, **after** the admin layer exists (see [Initial creation through CI](#initial-creation-through-ci)). After that, CI can plan the whole stack and apply EKS, ECR and log-group changes.
+
+**For the GitHub Actions user** the permissions come from two managed policies, both admin-managed:
+- `<project>-github-actions-deploy` (`modules/iam/github_deploy_policy.tf`): day-to-day permissions.
+- `<project>-github-actions-create` (`modules/iam/github_deploy_create_policy.tf`): create-only permissions for first provisioning. It is a separate policy because one managed policy is limited to 6,144 characters.
 
 | Area | Scope |
 |---|---|
 | S3 state | List on the bucket; Get/Put/Delete only on the state key and its `.tflock` |
-| EC2/VPC | **Read-only** (`ec2:Describe*`, region-restricted). No VPC, subnet, gateway, NAT, Elastic IP, route, security-group or launch-template changes, and no `CreateTags`/`DeleteTags` |
+| EC2/VPC read | `ec2:Describe*`, region-restricted |
+| EC2/VPC create (create policy) | `CreateVpc/Subnet/InternetGateway/RouteTable/NatGateway/LaunchTemplate`, `AllocateAddress`: only when the request carries tag `Project=<project>`, region-restricted. `CreateTags` only as part of those creations. `Modify*/Attach*/CreateRoute/ReplaceRoute/AssociateRouteTable/CreateLaunchTemplateVersion` only on resources tagged `Project=<project>`. **No Delete*, Release*, Detach*, Disassociate*.** |
 | EKS | Cluster, node group, access entry actions on `<project>-*` only |
-| IAM | **Read-only** on roles named `<project>-*` (no create/update/delete, no trust-policy, inline or attached-policy writes, which would let CI escalate to admin); `PassRole` only on the exact EKS cluster role and node role ARNs, and only to EKS; service-linked role creation for EKS/nodegroup/autoscaling; read-only on its own user/policy |
-| KMS | Describe/rotation-status/key-policy/tag reads and `CreateGrant` on the single secrets key only; no key creation, policy changes or deletion |
+| IAM read | Roles named `<project>-*`, and its own user/policies/boundary (read-only) |
+| IAM create (create policy) | `CreateRole` and `TagRole` **only** on the exact EKS cluster role and node role ARNs, and `CreateRole` only when the permissions boundary `<project>-eks-role-boundary` is set. `AttachRolePolicy` only for the 4 AWS-managed policies those roles use. `PutRolePolicy` only on the cluster role (the boundary caps what it can grant). Explicit **deny** on removing or replacing the boundary |
+| IAM self-protection | Explicit **deny** on any write to the CI user, both CI policies, the admin policy and the boundary (including new policy versions, attaching policies, access keys) |
+| IAM other | `PassRole` only on the exact two EKS role ARNs, only to EKS; service-linked roles for EKS/nodegroup/autoscaling |
+| KMS | Read, rotation status, `CreateGrant` on keys tagged `Project=<project>`. Create (create policy): `CreateKey`+`TagResource` only with request tags `Project=<project>` and `ManagedBy=terraform`; `EnableKeyRotation` and alias target only on tagged keys; `CreateAlias` only for `alias/<cluster>-secrets`. **No PutKeyPolicy, no ScheduleKeyDeletion** |
 | Logs | Manage only `/aws/eks/<project>-*` log groups |
 | ECR | Manage only the one repository (Terraform management, not image push) |
 
-The deploy identity has no IAM write access and no EC2/VPC write access. It can still create, change and delete the EKS cluster and node group (including access entries and public endpoint settings) and the ECR repository, so treat its keys as sensitive and move to OIDC (`modules/iam/github_oidc.tf.example`). Pushing images from CI will need a separate ECR push policy later.
+**Unavoidable wildcards (each documented in the `.tf` files):**
+- `Resource "*"` for `ec2:Create*`/`AllocateAddress` and `kms:CreateKey`/`kms:TagResource`: a new resource has no ARN yet. Mitigation: required `Project`/`ManagedBy` request tags and region.
+- `vpc/*`, `subnet/*`, `route-table/*`, `key/*`, ...: AWS generates the IDs. Mitigation: the `Project` resource tag condition.
+- `security-group/*` for `RevokeSecurityGroupIngress/Egress` and tagging: `aws_default_security_group` must empty the VPC's untagged default group, so it can't be scoped by tag. It can only remove rules, never open traffic.
+- In the boundary: `ec2:*` and `elasticloadbalancing:*` (region-limited), because the AWS-managed EKS policies use many such actions that AWS changes over time. It is a ceiling, not a grant.
+
+The deploy identity can still call EKS/ECR/log-group delete APIs directly (the IAM policy grants them for operations). The workflow's delete guard blocks them from CI, but treat the CI keys as sensitive and move to OIDC (`modules/iam/github_oidc.tf.example`). Pushing images from CI will need a separate ECR push policy later.
 
 ### Admin / CI permission boundary
 
 | | Admin (human, outside CI) | GitHub Actions CI |
 |---|---|---|
-| IAM roles, policies, CI user | create/change (`modules/iam`) | read-only |
-| KMS secrets key | create/change | read, plus `CreateGrant` on that one key |
-| EC2/VPC (VPC, subnets, IGW, NAT, EIPs, routes, security groups, launch templates, tags) | full, via the `<project>-admin-ec2-vpc` policy or equivalent | `ec2:Describe*` only |
-| EKS cluster / node group | full | create/update/delete, scoped to `<project>-*` |
+| CI IAM user, both CI policies, permissions boundary, admin EC2/VPC policy | create/change (`modules/iam`), once | **never** (explicitly denied; blocked by the workflow allow-list) |
+| EKS cluster and node IAM roles | any | create only, with the boundary attached |
+| KMS secrets key | create/change | create only (tag/region-conditioned); read, `CreateGrant` |
+| VPC, subnets, IGW, NAT, EIP, route tables, default SG, launch template | full, via `<project>-admin-ec2-vpc` or equivalent | create only (launch template may also be updated); no deletes |
+| EKS cluster / node group | full | create/update; deletes blocked by the guard |
 | ECR repository, control-plane log group | full | manage, scoped to the one repo / `/aws/eks/<project>-*` |
 | State bucket | created manually (Console) | read/write only the state object and its lock |
 | `iam:PassRole` | any | exact cluster-role and node-role ARNs, only to EKS |
 
+Workflow allow-list (`terraform.yml`, plan job):
+- **Create and update:** `aws_eks_cluster`, `aws_eks_node_group`, `aws_eks_access_entry`, `aws_eks_access_policy_association`, `aws_ecr_repository`, `aws_ecr_lifecycle_policy`, `aws_cloudwatch_log_group`, `aws_launch_template`.
+- **Create only:** `aws_vpc`, `aws_subnet`, `aws_internet_gateway`, `aws_nat_gateway`, `aws_eip`, `aws_route_table`, `aws_route_table_association`, `aws_default_security_group`, `aws_kms_key`, `aws_kms_alias`, and `aws_iam_role`, `aws_iam_role_policy`, `aws_iam_role_policy_attachment` **only for the two EKS roles** (the OIDC roles are not allowed).
+- **Never:** `aws_iam_user`, `aws_iam_policy`, `aws_iam_user_policy_attachment`, anything that deletes or replaces, any unlisted type.
+- **Cluster-admin guard:** a plan that creates an EKS cluster with `bootstrap_cluster_creator_admin_permissions` not `false` is blocked (and re-checked in the apply job), because the creating identity would become Kubernetes cluster-admin.
+
 Consequences:
 
-- `modules/iam/admin_policy.tf` defines the admin EC2/VPC permission set as a managed policy (`admin_ec2_vpc_policy_arn` output). **Terraform does not attach it to anyone.** Attach it (or `AdministratorAccess`) to your admin role or group yourself. It covers EC2/VPC only; initial provisioning also needs IAM, KMS, EKS, ECR, CloudWatch Logs and S3 permissions, which is why an administrator-level identity is assumed. Never attach it to the CI user.
-- Because CI cannot write EC2, a change to `modules/vpc` or to the node launch template in `modules/eks` must be applied by an admin. A CI `apply` containing such a change fails partway. Review the plan and run those applies as admin.
-- The identity that creates the cluster becomes its Kubernetes cluster admin (`bootstrap_cluster_creator_admin_permissions`). Run the first apply as the admin, not as CI.
+- `modules/iam/admin_policy.tf` defines the admin EC2/VPC permission set for humans (`admin_ec2_vpc_policy_arn` output). **Terraform does not attach it to anyone.** Attach it (or `AdministratorAccess`) to your admin role or group yourself. Never attach it to the CI user.
+- Changing an existing VPC/IAM/KMS resource (anything other than create) is an administrator job; CI blocks it.
+- **Kubernetes cluster-admin and CI:** with the current setting (`bootstrap_cluster_creator_admin_permissions = true`), CI **cannot** create the EKS cluster (the guard blocks it), so the cluster must be created by an administrator until the setting is changed. See the proposal in [Initial creation through CI](#initial-creation-through-ci).
+
+### Initial creation through CI
+
+**Existing-resource protection.** The plan job runs a read-only preflight (`.github/scripts/preflight_existing_resources.py`) on every plan that creates resources. It looks up the IAM roles, EKS cluster, ECR repository, log group, KMS alias, and VPC/subnet/gateway/route table/Elastic IP/NAT gateway (matched by `Name` tag) and fails the job if one already exists, or if it can't verify (fail closed). It never imports anything and never touches Terraform state. If it reports a conflict, an administrator removes the manual resource or runs `terraform import` locally; then re-run the workflow.
+
+**Required one-time admin step (before the first CI run).** The CI user and both CI policies must exist before CI can create anything, and the permissions boundary must exist before CI can create the EKS roles. Because these are admin-only, an administrator applies them from a local machine with admin credentials (same S3 backend, no migration), then CI creates the rest:
+1. `terraform init` and `terraform plan -out=admin.tfplan` with the same variable values CI uses (`public_access_cidrs` etc.; do not set `github_repository`).
+2. Review. The admin layer is `module.iam.aws_iam_policy.ci_role_boundary`, `aws_iam_user.github_actions`, `aws_iam_policy.github_deploy`, `aws_iam_policy.github_deploy_create`, both `aws_iam_user_policy_attachment` resources and `aws_iam_policy.admin_ec2_vpc`. Applying the full stack as admin is also fine; applying only this layer requires `-target`, which is an administrator decision.
+3. Create the CI user's access keys manually (Terraform never does) and store them as the GitHub secrets.
+4. Run the `infra Terraform` workflow. Expected: the plan shows creates for the network, roles, KMS key and launch template.
+
+**Proposal, not implemented: how CI could also create the EKS cluster safely.** Today the cluster uses `bootstrap_cluster_creator_admin_permissions = true`, so whoever creates it (CI) would become Kubernetes cluster-admin; the guard therefore blocks it. The secure alternative:
+1. Add a variable (e.g. `cluster_admin_principal_arn`, an IAM role/user of a human administrator) and an `aws_eks_access_entry` + `AmazonEKSClusterAdminPolicy` association for it through `additional_access_entries`.
+2. Set `bootstrap_cluster_creator_admin_permissions = false` in `modules/eks/main.tf`.
+3. The guard then allows CI to create the cluster, and CI holds no Kubernetes permissions.
+Caveat: this setting forces replacement of an existing cluster, so it must be done before the cluster is created. It needs your decision and the administrator principal ARN.
+
+**Not verified.** None of the new permissions or the tag-based EC2/KMS conditions have been exercised against a real AWS account. Expect to refine them after a test run; the plan job and the IAM policy are meant to fail closed, so a missing permission stops the apply rather than widening access.
 
 ## Estimated cost (rough, us-east-1, verify on the AWS pricing pages)
 

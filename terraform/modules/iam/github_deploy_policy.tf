@@ -1,12 +1,13 @@
 # Permissions for the Terraform deploy identity (user today, OIDC role later).
 #
-# Admin / CI boundary: this policy holds only what CI needs after an admin has
-# provisioned the stack. It has resource-scoped permissions for the state
-# bucket, EKS, the control-plane log group and ECR; read-only access to IAM,
-# KMS and EC2; and PassRole on exactly the two EKS roles. Every IAM write, KMS
-# key write and EC2/VPC write (VPC, subnets, gateways, NAT, Elastic IPs, routes,
-# security groups, launch templates, tagging) is Admin-only. See
-# admin_policy.tf for the EC2/VPC administration permissions.
+# Admin / CI boundary: this policy holds the day-to-day CI permissions. It has
+# resource-scoped permissions for the state bucket, EKS, the control-plane log
+# group and ECR; read-only access to IAM, KMS and EC2; and PassRole on exactly the
+# two EKS roles. The CREATE-ONLY permissions for first-time provisioning (VPC,
+# the two EKS roles behind a permissions boundary, the KMS key, the launch
+# template) live in the second policy, github_deploy_create_policy.tf. Everything
+# else (the CI user, both CI policies, the boundary, IAM/KMS key policy changes,
+# any delete) is Admin-only. See admin_policy.tf for the human admin EC2/VPC set.
 
 locals {
   arn_prefix = "arn:${local.partition}"
@@ -30,12 +31,11 @@ data "aws_iam_policy_document" "github_deploy" {
     ]
   }
 
-  # --- EC2 / VPC: READ-ONLY from CI -----------------------------------------
+  # --- EC2 / VPC: read here; create-only writes are in the second policy -----
   # Needed so `plan` can refresh the VPC, subnet, NAT, route, security group and
-  # launch template resources. There are deliberately NO EC2 write actions here
-  # (no VPC/subnet/gateway/NAT/EIP/route/security-group/launch-template changes,
-  # no CreateTags/DeleteTags): they are Admin-only (admin_policy.tf). Changes to
-  # the VPC module or the node launch template are applied by an admin.
+  # launch template resources. There are deliberately NO EC2 write actions in THIS
+  # policy; the create-only ones are in github_deploy_create_policy.tf, and there
+  # are no Delete*/Release* actions anywhere for CI.
   statement {
     sid       = "Ec2Describe"
     actions   = ["ec2:Describe*"]
@@ -96,8 +96,8 @@ data "aws_iam_policy_document" "github_deploy" {
     sid     = "IamPassEksRolesToEks"
     actions = ["iam:PassRole"]
     resources = [
-      aws_iam_role.eks_cluster.arn,
-      aws_iam_role.eks_node.arn,
+      local.eks_cluster_role_arn,
+      local.eks_node_role_arn,
     ]
     condition {
       test     = "StringEquals"
@@ -129,7 +129,9 @@ data "aws_iam_policy_document" "github_deploy" {
     resources = [
       "${local.arn_prefix}:iam::${local.account_id}:user/ci/${local.github_user_name}",
       "${local.arn_prefix}:iam::${local.account_id}:policy/${local.deploy_policy}",
+      "${local.arn_prefix}:iam::${local.account_id}:policy/${local.deploy_create_policy}",
       "${local.arn_prefix}:iam::${local.account_id}:policy/${local.admin_ec2_vpc_policy_name}",
+      local.role_boundary_arn,
     ]
   }
 
@@ -140,17 +142,23 @@ data "aws_iam_policy_document" "github_deploy" {
     resources = ["${local.arn_prefix}:iam::${local.account_id}:oidc-provider/token.actions.githubusercontent.com"]
   }
 
-  # --- KMS: the secrets key is created by this module (admin apply), so CI only
-  # needs read access plus CreateGrant (EKS requires the caller to be able to
-  # create a grant when enabling secrets encryption). Scoped to that one key;
-  # CI cannot create, re-policy or delete keys.
+  # --- KMS: read access plus CreateGrant (EKS requires the caller to be able to
+  # create a grant when enabling secrets encryption). Scoped to keys tagged
+  # Project=<project_name> (the key ID is unknown until CI creates the key, so the
+  # ARN ends in key/*; the tag is the scope). Creating the key is in
+  # github_deploy_create_policy.tf; CI can never re-policy or delete a key.
   statement {
     sid = "KmsSecretsKeyUse"
     actions = [
       "kms:DescribeKey", "kms:GetKeyRotationStatus", "kms:GetKeyPolicy",
       "kms:ListResourceTags", "kms:CreateGrant",
     ]
-    resources = [aws_kms_key.eks_secrets.arn]
+    resources = ["${local.arn_prefix}:kms:${var.aws_region}:${local.account_id}:key/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/Project"
+      values   = [var.project_name]
+    }
   }
 
   statement {

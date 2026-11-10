@@ -13,8 +13,9 @@ data "aws_iam_policy_document" "eks_cluster_assume" {
 }
 
 resource "aws_iam_role" "eks_cluster" {
-  name               = "${var.project_name}-eks-cluster-role"
-  assume_role_policy = data.aws_iam_policy_document.eks_cluster_assume.json
+  name                 = local.eks_cluster_role_name
+  assume_role_policy   = data.aws_iam_policy_document.eks_cluster_assume.json
+  permissions_boundary = aws_iam_policy.ci_role_boundary.arn
 }
 
 resource "aws_iam_role_policy_attachment" "eks_cluster" {
@@ -37,8 +38,9 @@ data "aws_iam_policy_document" "eks_node_assume" {
 }
 
 resource "aws_iam_role" "eks_node" {
-  name               = "${var.project_name}-eks-node-role"
-  assume_role_policy = data.aws_iam_policy_document.eks_node_assume.json
+  name                 = local.eks_node_role_name
+  assume_role_policy   = data.aws_iam_policy_document.eks_node_assume.json
+  permissions_boundary = aws_iam_policy.ci_role_boundary.arn
 }
 
 # Exactly the three AWS-managed policies EKS managed node groups require.

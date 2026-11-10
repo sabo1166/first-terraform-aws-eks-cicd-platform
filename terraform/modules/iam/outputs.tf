@@ -38,6 +38,16 @@ output "admin_ec2_vpc_policy_arn" {
   value       = aws_iam_policy.admin_ec2_vpc.arn
 }
 
+output "ci_role_boundary_arn" {
+  description = "ARN of the ADMIN-MANAGED permissions boundary that CI must attach to the EKS cluster and node roles it creates."
+  value       = aws_iam_policy.ci_role_boundary.arn
+}
+
+output "github_actions_create_policy_arn" {
+  description = "ARN of the ADMIN-MANAGED create-only policy for CI initial provisioning."
+  value       = aws_iam_policy.github_deploy_create.arn
+}
+
 output "github_actions_deploy_policy_arn" {
   description = "ARN of the GitHub Actions Terraform deploy policy."
   value       = aws_iam_policy.github_deploy.arn
