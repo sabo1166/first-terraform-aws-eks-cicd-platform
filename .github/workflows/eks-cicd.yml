@@ -1,0 +1,264 @@
+# Application CI/CD for the EKS platform.
+#
+#   validate         every push / PR     checks only, no AWS access
+#   build-and-push   every push / PR     build + vulnerability scan; pushes to ECR
+#                                        ONLY on a push to main (OIDC, push-only role)
+#   deploy           push to main only   runs in the `production` environment, so
+#                                        GitHub waits for a required reviewer to approve
+#                                        BEFORE any deployment command runs.
+#
+# Nothing here deploys automatically, and pull requests can never reach `deploy`.
+# Setup (OIDC roles, GitHub Environment, variables): see docs/OPERATIONS.md "Application CI/CD".
+#
+# Third-party actions are pinned to full commit SHAs (the comment gives the tag).
+name: EKS CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege by default; jobs that need more declare it explicitly.
+permissions:
+  contents: read
+
+concurrency:
+  group: eks-cicd-${{ github.ref }}
+  # Never cancel a main-branch run that may be waiting for approval or deploying.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  APP_DIR: app # Dockerfile + application source (build context)
+  K8S_DIR: k8s # Kubernetes manifests (image: ${IMAGE} placeholder)
+  TF_DIR: terraform
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. validate: static checks and tests. No cloud credentials.
+  # ---------------------------------------------------------------------------
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "<2.0.0"
+          terraform_wrapper: false
+
+      - name: Terraform fmt
+        run: terraform -chdir="$TF_DIR" fmt -check -recursive
+
+      - name: Terraform validate (root and bootstrap, no backend, no credentials)
+        run: |
+          set -euo pipefail
+          for dir in "$TF_DIR" "$TF_DIR/bootstrap"; do
+            echo "::group::validate $dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+            echo "::endgroup::"
+          done
+
+      - name: Require application files
+        run: |
+          set -euo pipefail
+          test -f "$APP_DIR/Dockerfile" || { echo "::error::$APP_DIR/Dockerfile not found"; exit 1; }
+          ls "$K8S_DIR"/*.y*ml >/dev/null 2>&1 || { echo "::error::no manifests found in $K8S_DIR/"; exit 1; }
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: ${{ env.APP_DIR }}/Dockerfile
+          failure-threshold: warning
+
+      - name: Reject cluster-scoped Kubernetes objects
+        # The production deploy identity is limited to ONE namespace. Fail early
+        # (before approval is requested) on manifests it could never apply.
+        run: |
+          set -euo pipefail
+          if grep -REn '^kind:[[:space:]]*(Namespace|ClusterRole|ClusterRoleBinding|CustomResourceDefinition|PersistentVolume|StorageClass|MutatingWebhookConfiguration|ValidatingWebhookConfiguration)[[:space:]]*$' "$K8S_DIR"; then
+            echo "::error::cluster-scoped objects are not allowed in $K8S_DIR/ (deploys are namespace-scoped)"
+            exit 1
+          fi
+
+      - name: Validate Kubernetes manifests (kubeconform)
+        run: |
+          docker run --rm -v "$PWD/$K8S_DIR:/manifests:ro" \
+            ghcr.io/yannh/kubeconform:v0.8.0 -strict -summary /manifests
+
+      - name: Run application tests
+        run: |
+          set -euo pipefail
+          if [ -f "$APP_DIR/test.sh" ]; then
+            (cd "$APP_DIR" && bash ./test.sh)
+          else
+            echo "::warning::$APP_DIR/test.sh not found - no application tests were run"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # 2. build-and-push: build, scan, then (main only) push to ECR. Never deploys.
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: build-and-push
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # request the OIDC token; only used on push to main
+    outputs:
+      image: ${{ steps.push.outputs.image }} # registry/repo@sha256:<digest>
+      digest: ${{ steps.push.outputs.digest }}
+    env:
+      IMAGE_TAG: ${{ github.sha }} # ECR tags are immutable; one tag per commit
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      PUSH_ENABLED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build image (local only)
+        run: docker build --pull --tag "local/app:${IMAGE_TAG}" "$APP_DIR"
+
+      - name: Scan image for vulnerabilities (fails on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: local/app:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # ---- everything below runs only on a push to main ---------------------
+      - name: Configure AWS credentials (OIDC, push-only role)
+        if: env.PUSH_ENABLED == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_PUSH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        if: env.PUSH_ENABLED == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Push the scanned image (or reuse the existing tag)
+        if: env.PUSH_ENABLED == 'true'
+        id: push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          remote="${REGISTRY}/${ECR_REPOSITORY}"
+
+          # Tags are immutable: on a re-run of the same commit the tag already exists.
+          if digest=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+                --image-ids imageTag="$IMAGE_TAG" \
+                --query 'imageDetails[0].imageDigest' --output text 2>/dev/null); then
+            echo "Tag ${IMAGE_TAG} already in ECR; reusing it."
+          else
+            docker tag "local/app:${IMAGE_TAG}" "${remote}:${IMAGE_TAG}"
+            docker push "${remote}:${IMAGE_TAG}"
+            digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${remote}:${IMAGE_TAG}" | cut -d@ -f2)
+          fi
+
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::unexpected image digest"; exit 1; }
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "image=${remote}@${digest}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Image pushed"
+            echo "- repository: \`${ECR_REPOSITORY}\`"
+            echo "- tag: \`${IMAGE_TAG}\`"
+            echo "- digest: \`${digest}\`"
+            echo ""
+            echo "Awaiting approval of the **production** deployment."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 3. deploy: waits for manual approval (environment: production).
+  #    GitHub does not start this job, and no step runs, until a required
+  #    reviewer approves. The OIDC deploy role can only be assumed by jobs that
+  #    declare this environment.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: deploy
+    needs: build-and-push
+    # Pull requests and non-main refs can never deploy.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Use a runner whose egress IP is in `public_access_cidrs`, or one inside the
+    # VPC (private API endpoint). GitHub-hosted runners are not allow-listed by default.
+    runs-on: ${{ vars.DEPLOY_RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    environment:
+      name: production
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ needs.build-and-push.outputs.image }}
+      DIGEST: ${{ needs.build-and-push.outputs.digest }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      K8S_NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      K8S_DEPLOYMENT: ${{ vars.K8S_DEPLOYMENT }}
+    steps:
+      - name: Checkout (same commit that was built)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure AWS credentials (OIDC, deploy role)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify the approved image exists in ECR
+        run: |
+          set -euo pipefail
+          [[ -n "$IMAGE" && "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest from the build job"; exit 1; }
+          aws ecr describe-images --repository-name "$ECR_REPOSITORY" \
+            --image-ids imageDigest="$DIGEST" --query 'imageDetails[0].imageDigest' --output text
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@bda439f5f36b99b262ebdcd3613869bddb064c8e # v5.2.0
+        with:
+          version: v1.35.0
+
+      - name: Configure kubeconfig
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Deploy the approved image (by digest)
+        run: |
+          set -euo pipefail
+          # Substitute only ${IMAGE}; other $ characters in the manifests are left alone.
+          for f in "$K8S_DIR"/*.yaml "$K8S_DIR"/*.yml; do
+            [ -f "$f" ] || continue
+            envsubst '${IMAGE}' < "$f"
+            echo "---"
+          done | kubectl apply --namespace "$K8S_NAMESPACE" --filename -
+
+      - name: Wait for the rollout
+        run: kubectl --namespace "$K8S_NAMESPACE" rollout status "deployment/${K8S_DEPLOYMENT}" --timeout=300s
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed to production"
+            echo "- cluster: \`${EKS_CLUSTER_NAME}\`"
+            echo "- namespace: \`${K8S_NAMESPACE}\`"
+            echo "- image: \`${IMAGE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

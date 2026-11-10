@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars (gitignored) or supply as TF_VAR_* in CI.
+
+# REQUIRED: who may reach the public EKS API endpoint. Never 0.0.0.0/0.
+# Find your IP, then use /32:  curl https://checkip.amazonaws.com
+public_access_cidrs = ["203.0.113.10/32"]
+
+# REQUIRED: bucket created by ./bootstrap.
+tfstate_bucket_name = "REPLACE-WITH-YOUR-STATE-BUCKET-NAME"
+
+# Enables the OIDC roles used by .github/workflows/eks-cicd.yml (leave empty to skip):
+# github_repository = "your-github-user-or-org/your-repo"
+# github_oidc_provider_arn = null   # set if the account already has the GitHub OIDC provider
+
+# Optional overrides (defaults shown in variables.tf):
+# project_name        = "eks-cicd-platform"
+# kubernetes_version  = "1.35"
+# ecr_repository_name = "first-k8s-project"

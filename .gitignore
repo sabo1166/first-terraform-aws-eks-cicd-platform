@@ -1,0 +1,29 @@
+# Terraform local working files
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+tfplan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Variable files with real values (examples are committed)
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Backend configuration with real values (example is committed)
+backend.hcl
+!backend.hcl.example
+
+# Credentials / secrets
+.env
+*.pem
+*.key
+.aws/

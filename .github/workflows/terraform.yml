@@ -1,0 +1,263 @@
+# Terraform infrastructure pipeline: plan -> manual approval -> apply.
+#
+#   plan    you start the workflow by hand   init, validate, plan (-out=tfplan);
+#                                            the plan is encrypted and uploaded as an artifact
+#   apply   runs in the `production`         GitHub waits for a required reviewer to approve
+#           environment                      BEFORE any apply command runs; applies the EXACT
+#                                            plan from the plan job (no new plan), then prints
+#                                            the Terraform outputs
+#
+# Only `workflow_dispatch`: nothing here runs on push or pull_request.
+# Setup (secrets, variables, GitHub Environment): see docs/OPERATIONS.md "Terraform workflow".
+#
+# IMPORTANT: this uses the CI identity, which has NO IAM, KMS or EC2/VPC write
+# permissions (they are Admin-only). A plan that changes those resources is
+# reported, but is NOT offered for apply. Apply it as an admin instead.
+name: infra Terraform
+
+on:
+  workflow_dispatch:
+
+# Least privilege by default; no job needs more than read access to the repo.
+permissions:
+  contents: read
+
+# One infrastructure run at a time. Runs are queued, never cancelled: cancelling
+# while a plan is waiting for approval or an apply is running could leave state half-changed.
+concurrency:
+  group: terraform-infra
+  cancel-in-progress: false
+
+env:
+  TF_WORKING_DIR: terraform # verified: this repo's Terraform lives in ./terraform (there is no EKS-Terraform folder)
+  TF_VERSION: "1.16.2" # exact version: plan and apply must use the same Terraform binary
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  # Non-secret configuration (repository variables, not secrets). tfvars files are not committed.
+  TF_VAR_tfstate_bucket_name: ${{ vars.TFSTATE_BUCKET_NAME }}
+  TF_VAR_public_access_cidrs: ${{ vars.PUBLIC_ACCESS_CIDRS }} # JSON list, e.g. ["203.0.113.10/32"]; never 0.0.0.0/0
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. plan: runs automatically after you start the workflow.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+      ci_applicable: ${{ steps.guard.outputs.ci_applicable }}
+      plan_sha256: ${{ steps.encrypt.outputs.plan_sha256 }}
+      artifact_name: ${{ steps.encrypt.outputs.artifact_name }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record commit SHA
+        id: commit
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          [ "$sha" = "$GITHUB_SHA" ] || { echo "::error::checked-out commit ($sha) is not the workflow commit ($GITHUB_SHA)"; exit 1; }
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        # Prints only the caller ARN, never credentials.
+        run: aws sts get-caller-identity --query Arn --output text
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform -chdir="$TF_WORKING_DIR" init -backend-config="bucket=${TF_VAR_tfstate_bucket_name}"
+
+      - name: Terraform Validate
+        run: terraform -chdir="$TF_WORKING_DIR" validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set -uo pipefail
+          set +e # GitHub's default shell uses -e, which would abort on exit code 2 below
+          # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present.
+          terraform -chdir="$TF_WORKING_DIR" plan -no-color -detailed-exitcode -out=tfplan
+          code=$?
+          if [ "$code" -eq 1 ]; then
+            exit 1
+          fi
+          if [ "$code" -eq 2 ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No changes. Infrastructure matches the configuration." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Check the plan only changes resources CI can apply
+        id: guard
+        if: steps.plan.outputs.has_changes == 'true'
+        run: |
+          set -euo pipefail
+          # CI has no IAM/KMS/EC2 write permissions. Allow-list the resource types CI may change;
+          # anything else must be applied by an administrator.
+          terraform -chdir="$TF_WORKING_DIR" show -json tfplan > "$RUNNER_TEMP/plan.json"
+          blocked="$(python3 -I - "$RUNNER_TEMP/plan.json" <<'PY'
+          import json, sys
+          allowed = {
+              "aws_eks_cluster", "aws_eks_node_group", "aws_eks_access_entry",
+              "aws_eks_access_policy_association", "aws_ecr_repository",
+              "aws_ecr_lifecycle_policy", "aws_cloudwatch_log_group",
+          }
+          with open(sys.argv[1]) as f:
+              plan = json.load(f)
+          for rc in plan.get("resource_changes") or []:
+              if rc["change"]["actions"] in (["no-op"], ["read"]):
+                  continue
+              if rc["type"] not in allowed:
+                  print(rc["address"])
+          PY
+          )"
+          rm -f "$RUNNER_TEMP/plan.json"   # may contain sensitive values
+          if [ -n "$blocked" ]; then
+            echo "ci_applicable=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Plan needs an administrator"
+              echo "This plan changes resources the CI identity is not allowed to apply."
+              echo "Review the plan above, then apply as an admin. Nothing was uploaded and no approval is offered."
+              echo '```'
+              echo "$blocked"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::plan contains admin-only changes; CI apply is not offered"
+          else
+            echo "ci_applicable=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Encrypt plan
+        # The plan file can contain secrets in plain text and anyone with read access
+        # to the repository can download artifacts, so only an encrypted copy is uploaded.
+        id: encrypt
+        if: steps.plan.outputs.has_changes == 'true' && steps.guard.outputs.ci_applicable == 'true'
+        env:
+          TF_PLAN_ENCRYPTION_KEY: ${{ secrets.TF_PLAN_ENCRYPTION_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "$TF_PLAN_ENCRYPTION_KEY" ] || { echo "::error::secret TF_PLAN_ENCRYPTION_KEY is not set"; exit 1; }
+          cd "$TF_WORKING_DIR"
+          printf '%s' "$TF_PLAN_ENCRYPTION_KEY" | gpg --batch --yes --no-tty --pinentry-mode loopback \
+            --passphrase-fd 0 --symmetric --cipher-algo AES256 --output tfplan.gpg tfplan
+          rm -f tfplan
+          echo "plan_sha256=$(sha256sum tfplan.gpg | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=tfplan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        if: steps.plan.outputs.has_changes == 'true' && steps.guard.outputs.ci_applicable == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.encrypt.outputs.artifact_name }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan.gpg
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Remove local plan files
+        if: always()
+        run: rm -f "$TF_WORKING_DIR/tfplan" "$TF_WORKING_DIR/tfplan.gpg" "$RUNNER_TEMP/plan.json"
+
+  # ---------------------------------------------------------------------------
+  # 2. apply: waits for manual approval (environment: production).
+  #    GitHub does not start this job, and no step runs, until a required
+  #    reviewer approves. Only runs for the main branch, and only for plans
+  #    that CI is allowed to apply.
+  # ---------------------------------------------------------------------------
+  apply:
+    name: Terraform Apply
+    needs: plan
+    if: >-
+      needs.plan.outputs.has_changes == 'true' &&
+      needs.plan.outputs.ci_applicable == 'true' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment:
+      name: production
+    env:
+      PLAN_SHA: ${{ needs.plan.outputs.sha }}
+      PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+      PLAN_ARTIFACT: ${{ needs.plan.outputs.artifact_name }}
+    steps:
+      - name: Checkout repository (same commit as the plan)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify the plan and apply use the same commit
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$PLAN_SHA" ] && [ "$PLAN_SHA" = "$GITHUB_SHA" ] \
+            || { echo "::error::commit mismatch between plan and apply"; exit 1; }
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity --query Arn --output text
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform -chdir="$TF_WORKING_DIR" init -backend-config="bucket=${TF_VAR_tfstate_bucket_name}"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.PLAN_ARTIFACT }}
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Verify and decrypt plan
+        # The checksum comes from the plan job's output, so a swapped or altered
+        # artifact is rejected before it is decrypted or applied.
+        env:
+          TF_PLAN_ENCRYPTION_KEY: ${{ secrets.TF_PLAN_ENCRYPTION_KEY }}
+        run: |
+          set -euo pipefail
+          cd "$TF_WORKING_DIR"
+          echo "${PLAN_SHA256}  tfplan.gpg" | sha256sum --check --status \
+            || { echo "::error::plan artifact checksum mismatch"; exit 1; }
+          printf '%s' "$TF_PLAN_ENCRYPTION_KEY" | gpg --batch --yes --no-tty --pinentry-mode loopback \
+            --passphrase-fd 0 --decrypt --output tfplan tfplan.gpg
+          rm -f tfplan.gpg
+
+      - name: Terraform Apply
+        # Applies the saved plan exactly as approved. Terraform refuses it if the
+        # state changed since the plan was made. No new plan is generated here.
+        run: terraform -chdir="$TF_WORKING_DIR" apply -input=false -auto-approve tfplan
+
+      - name: Terraform Outputs
+        run: terraform -chdir="$TF_WORKING_DIR" output -no-color
+
+      - name: Remove local plan files
+        if: always()
+        run: rm -f "$TF_WORKING_DIR/tfplan" "$TF_WORKING_DIR/tfplan.gpg"

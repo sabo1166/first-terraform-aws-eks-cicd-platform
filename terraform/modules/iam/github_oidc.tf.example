@@ -1,0 +1,60 @@
+# FUTURE MIGRATION: GitHub OIDC for the TERRAFORM pipeline (not active; Terraform
+# ignores *.example files).
+#
+# NOTE: github_oidc.tf already defines aws_iam_openid_connect_provider.github
+# (when var.github_repository is set) and the roles for the APPLICATION pipeline.
+# When activating this example, reuse that provider (local.github_oidc_provider_arn)
+# instead of declaring a second one: an account allows only one per URL.
+#
+# 1. Rename to github_oidc.tf, add variables github_repository ("owner/repo")
+#    and create/lookup the OIDC provider.
+# 2. Update .github/workflows/terraform.yml to use
+#    aws-actions/configure-aws-credentials with `role-to-assume` and
+#    `permissions: id-token: write`, and delete the AWS_ACCESS_KEY_ID /
+#    AWS_SECRET_ACCESS_KEY repository secrets.
+# 3. Remove aws_iam_user.github_actions and its attachment from github_actions.tf
+#    (aws_iam_policy.github_deploy is reused unchanged).
+#
+# resource "aws_iam_openid_connect_provider" "github" {
+#   url             = "https://token.actions.githubusercontent.com"
+#   client_id_list  = ["sts.amazonaws.com"]
+#   # thumbprint_list is optional/ignored by AWS for this provider on current provider versions
+# }
+#
+# data "aws_iam_policy_document" "github_oidc_assume" {
+#   statement {
+#     actions = ["sts:AssumeRoleWithWebIdentity"]
+#
+#     principals {
+#       type        = "Federated"
+#       identifiers = [aws_iam_openid_connect_provider.github.arn]
+#     }
+#
+#     condition {
+#       test     = "StringEquals"
+#       variable = "token.actions.githubusercontent.com:aud"
+#       values   = ["sts.amazonaws.com"]
+#     }
+#
+#     # Restrict to ONE repository and branch (never use a bare wildcard):
+#     condition {
+#       test     = "StringLike"
+#       variable = "token.actions.githubusercontent.com:sub"
+#       values   = ["repo:OWNER/REPO:ref:refs/heads/main"]
+#     }
+#   }
+# }
+#
+# resource "aws_iam_role" "github_actions" {
+#   name               = "${var.project_name}-github-actions"
+#   assume_role_policy = data.aws_iam_policy_document.github_oidc_assume.json
+# }
+#
+# resource "aws_iam_role_policy_attachment" "github_deploy" {
+#   role       = aws_iam_role.github_actions.name
+#   policy_arn = aws_iam_policy.github_deploy.arn
+# }
+#
+# Note: the deploy policy's IamPassRole/role-name scoping uses "<project>-*", so
+# name the OIDC role carefully or exclude it from that glob if you want CI to be
+# unable to modify its own role.
