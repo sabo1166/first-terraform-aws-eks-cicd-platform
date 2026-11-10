@@ -9,9 +9,9 @@
 #     actions, so CI cannot destroy any of this (the workflow's delete guard enforces
 #     the same rule on the plan; this enforces it in IAM).
 #   * CI can NOT manage its own identity. The CI user, both CI policies, the admin
-#     EC2/VPC policy and the permissions boundary are admin-only: they are not on the
-#     workflow allow-list and are explicitly denied below. Otherwise CI could edit its
-#     own policy or attach AdministratorAccess to itself.
+#     EC2/VPC policy and the permissions boundary are admin-only: they are explicitly
+#     denied below (the workflow has no resource-type allow-list, so IAM is the control).
+#     Otherwise CI could edit its own policy or attach AdministratorAccess to itself.
 #   * Everything is limited to var.aws_region and, where AWS supports it, to resources
 #     tagged Project=<project_name> (the provider's default_tags put that tag on every
 #     resource Terraform creates).

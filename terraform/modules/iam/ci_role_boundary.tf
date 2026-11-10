@@ -8,8 +8,8 @@
 # an administrator role: anything outside this list is denied for the two roles.
 #
 # This policy itself is admin-only: CI has no write access to it (see the explicit
-# deny in github_deploy_create_policy.tf), and the workflow allow-list rejects
-# aws_iam_policy resources. An administrator must apply it BEFORE CI creates the roles.
+# deny in github_deploy_create_policy.tf; an approved plan that includes it would fail at
+# apply). An administrator must apply it BEFORE CI creates the roles.
 #
 # Unavoidable wildcards (all documented, all only a ceiling):
 #   ec2:*, elasticloadbalancing:*  The AWS-managed EKS policies (cluster, CNI, worker)

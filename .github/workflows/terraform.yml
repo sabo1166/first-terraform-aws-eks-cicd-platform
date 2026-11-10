@@ -5,8 +5,8 @@
 #
 #   init      checkout, AWS identity check, Terraform setup, backend initialisation
 #   validate  terraform fmt -check, terraform validate (no AWS credentials needed)
-#   plan      terraform plan -out=tfplan, resource allow-list check, GPG-encrypted
-#             plan uploaded as an artifact
+#   plan      terraform plan -out=tfplan, read-only preflight for already-existing
+#             resources, GPG-encrypted plan uploaded as an artifact
 #   apply     runs in the `production` environment: GitHub holds the job until a
 #             required reviewer approves, BEFORE any apply step runs. Downloads the
 #             EXACT encrypted plan, verifies its SHA-256, decrypts it, applies it
@@ -19,17 +19,20 @@
 # Only `workflow_dispatch`: nothing here runs on push or pull_request.
 # Setup (secrets, variables, GitHub Environment): see docs/OPERATIONS.md "Terraform workflow".
 #
-# DELETE GUARD: a plan that deletes or replaces ANY resource is never offered for CI
-# apply (checked in the plan job and again on the decrypted plan in the apply job).
-# Deletions must be reviewed and applied by an administrator.
+# NO RESOURCE-TYPE ALLOW-LIST: the plan job no longer filters the plan by resource type, so
+# any plan with changes is encrypted, uploaded and offered for approval. What CI can actually
+# change is limited only by the IAM permissions of the CI identity (an apply that needs a
+# permission it lacks fails partway). The human review of the plan in the `production`
+# approval is the control that decides what is applied.
 #
-# CI SCOPE: this uses the CI identity (AWS access keys). It may CREATE the network (VPC),
-# the two EKS IAM roles (only behind the admin-managed permissions boundary), the EKS
-# secrets KMS key and the node launch template, and create/update EKS, ECR and the
-# control-plane log group. It can NEVER manage its own IAM user, its policies or the
-# boundary, never delete, and never become Kubernetes cluster-admin. A plan outside this
-# scope is reported, but is NOT offered for apply: an administrator applies it.
-# A read-only preflight fails the plan job if a resource it would create already exists.
+# Remaining automatic checks:
+#   * plan job:  read-only preflight; fails if a resource the plan would create already
+#                exists in AWS (it never imports and never touches Terraform state).
+#   * apply job: re-checks the decrypted plan right before apply and REFUSES it if it
+#                deletes or replaces any resource, or creates an EKS cluster with
+#                bootstrap_cluster_creator_admin_permissions != false (that would make the CI
+#                identity Kubernetes cluster-admin).
+#
 # The approval gate exists only once Required reviewers are configured on the
 # `production` environment (Settings -> Environments); this file cannot enforce that.
 name: infra Terraform
@@ -158,7 +161,7 @@ jobs:
 
   # ===========================================================================
   # Job 3: plan
-  # Produces the saved plan, checks it against the CI resource allow-list, and
+  # Produces the saved plan, runs the read-only existing-resource preflight, and
   # uploads ONLY an encrypted copy. The plain plan never leaves this runner.
   # ===========================================================================
   plan:
@@ -169,7 +172,6 @@ jobs:
     outputs:
       sha: ${{ steps.commit.outputs.sha }}
       has_changes: ${{ steps.plan.outputs.has_changes }}
-      ci_applicable: ${{ steps.guard.outputs.ci_applicable }}
       plan_sha256: ${{ steps.encrypt.outputs.plan_sha256 }}
       artifact_name: ${{ steps.encrypt.outputs.artifact_name }}
     steps:
@@ -228,91 +230,12 @@ jobs:
             echo "No changes. Infrastructure matches the configuration." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Check the plan only changes resources CI can apply
-        id: guard
-        if: steps.plan.outputs.has_changes == 'true'
-        run: |
-          set -euo pipefail
-          # Allow-list the resource types CI may change; anything else must be applied by an
-          # administrator. The CI IAM policies (modules/iam/github_deploy*_policy.tf) grant
-          # exactly these, so a blocked type could not be applied by CI anyway.
-          terraform -chdir="$TF_WORKING_DIR" show -json tfplan > "$RUNNER_TEMP/plan.json"
-          blocked="$(python3 -I - "$RUNNER_TEMP/plan.json" <<'PY'
-          import json, re, sys
-          # Types CI may create AND update in place (day-to-day layer).
-          allowed = {
-              "aws_eks_cluster", "aws_eks_node_group", "aws_eks_access_entry",
-              "aws_eks_access_policy_association", "aws_ecr_repository",
-              "aws_ecr_lifecycle_policy", "aws_cloudwatch_log_group",
-              "aws_launch_template",
-          }
-          # Types CI may only CREATE (initial provisioning). Changing them later, e.g. adding a
-          # permissions boundary to an existing role or editing a route, needs an administrator.
-          create_only = {
-              "aws_vpc", "aws_subnet", "aws_internet_gateway", "aws_nat_gateway", "aws_eip",
-              "aws_route_table", "aws_route_table_association", "aws_default_security_group",
-              "aws_kms_key", "aws_kms_alias",
-              "aws_iam_role", "aws_iam_role_policy", "aws_iam_role_policy_attachment",
-          }
-          # IAM role resources are limited to the two EKS roles (not the OIDC roles). The CI
-          # user, both CI policies, the admin policy and the permissions boundary are NEVER
-          # allowed: aws_iam_user, aws_iam_policy and aws_iam_user_policy_attachment are not
-          # listed above, so they are always blocked (no self-escalation).
-          iam_ok = re.compile(
-              r'^module\.iam\.(aws_iam_role\.eks_(cluster|node)'
-              r'|aws_iam_role_policy\.eks_cluster_kms'
-              r'|aws_iam_role_policy_attachment\.eks_cluster'
-              r'|aws_iam_role_policy_attachment\.eks_node\["[a-z_]+"\])$'
-          )
-          with open(sys.argv[1]) as f:
-              plan = json.load(f)
-          for rc in plan.get("resource_changes") or []:
-              actions = rc["change"]["actions"]
-              if actions in (["no-op"], ["read"]):
-                  continue
-              label = f'{rc["address"]}  [{"+".join(actions)}]'
-              # Delete guard: CI never applies a plan that deletes or replaces anything
-              # (actions contain "delete": delete, delete+create, create+delete).
-              if "delete" in actions:
-                  print(f'{label} deletes or replaces a resource')
-              elif rc["type"] in create_only and actions != ["create"]:
-                  print(f'{label} CI may only create this resource type; changes need an administrator')
-              elif rc["type"].startswith("aws_iam_role") and not iam_ok.match(rc["address"]):
-                  print(f'{label} IAM role resource is not one of the two EKS roles CI may create')
-              elif rc["type"] not in allowed and rc["type"] not in create_only:
-                  print(f'{label} resource type not allowed for CI')
-              elif rc["type"] == "aws_eks_cluster" and actions == ["create"]:
-                  # The identity that creates a cluster becomes its Kubernetes cluster-admin
-                  # when bootstrap_cluster_creator_admin_permissions is true. CI must not.
-                  after = rc["change"].get("after") or {}
-                  access = (after.get("access_config") or [{}])[0]
-                  if access.get("bootstrap_cluster_creator_admin_permissions") is not False:
-                      print(f'{label} would make the CI identity Kubernetes cluster-admin '
-                            '(bootstrap_cluster_creator_admin_permissions must be false for CI)')
-          PY
-          )"
-          rm -f "$RUNNER_TEMP/plan.json"   # may contain sensitive values
-          if [ -n "$blocked" ]; then
-            echo "ci_applicable=false" >> "$GITHUB_OUTPUT"
-            {
-              echo "### Plan blocked from CI apply"
-              echo "This plan deletes or replaces resources, or changes resources the CI identity is not allowed to apply."
-              echo "Review the plan above, then apply as an administrator. Nothing was uploaded and no approval is offered."
-              echo '```'
-              echo "$blocked"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::warning::plan contains deletions/replacements or admin-only changes; CI apply is not offered"
-          else
-            echo "ci_applicable=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Preflight - resources that already exist (read-only)
         # A create-only plan against an account where some of these resources already exist
         # (e.g. created by hand, or by an earlier run whose state was lost) would fail partway
         # or leave duplicates. This step only READS AWS. It never imports anything and never
         # touches Terraform state: on a conflict it fails the job so an administrator can decide.
-        if: steps.plan.outputs.has_changes == 'true' && steps.guard.outputs.ci_applicable == 'true'
+        if: steps.plan.outputs.has_changes == 'true'
         run: |
           set -euo pipefail
           terraform -chdir="$TF_WORKING_DIR" show -json tfplan > "$RUNNER_TEMP/plan.json"
@@ -323,7 +246,7 @@ jobs:
         # The plan file can contain secrets in plain text and anyone with read access
         # to the repository can download artifacts, so only an encrypted copy is uploaded.
         id: encrypt
-        if: steps.plan.outputs.has_changes == 'true' && steps.guard.outputs.ci_applicable == 'true'
+        if: steps.plan.outputs.has_changes == 'true'
         env:
           TF_PLAN_ENCRYPTION_KEY: ${{ secrets.TF_PLAN_ENCRYPTION_KEY }}
         run: |
@@ -337,7 +260,7 @@ jobs:
           echo "artifact_name=tfplan-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
       - name: Upload plan artifact
-        if: steps.plan.outputs.has_changes == 'true' && steps.guard.outputs.ci_applicable == 'true'
+        if: steps.plan.outputs.has_changes == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.encrypt.outputs.artifact_name }}
@@ -353,8 +276,8 @@ jobs:
   # Job 4: apply (manual approval)
   # `environment: production` makes GitHub hold this job until a required
   # reviewer approves; no step below runs before that. It runs only if every
-  # earlier job succeeded, the plan has changes, CI is allowed to apply them,
-  # and the run is on main.
+  # earlier job succeeded, the plan has changes, and the run is on main. Before
+  # applying it re-checks the decrypted plan (no deletes/replacements, no CI cluster-admin).
   # ===========================================================================
   apply:
     name: 4 - Terraform Apply
@@ -362,7 +285,6 @@ jobs:
     if: >-
       success() &&
       needs.plan.outputs.has_changes == 'true' &&
-      needs.plan.outputs.ci_applicable == 'true' &&
       github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 60
