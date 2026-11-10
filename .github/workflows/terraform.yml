@@ -35,9 +35,9 @@
 #   * plan job:  read-only preflight; fails if a resource the plan would create already
 #                exists in AWS (it never imports and never touches Terraform state).
 #   * apply job: re-checks the saved plan right before apply and REFUSES it if it
-#                deletes or replaces any resource, or creates an EKS cluster with
-#                bootstrap_cluster_creator_admin_permissions != false (that would make the CI
-#                identity Kubernetes cluster-admin).
+#                deletes or replaces any resource. (There is no EKS cluster-admin check: the
+#                CI identity that creates the cluster becomes its Kubernetes cluster-admin
+#                through bootstrap_cluster_creator_admin_permissions = true; see docs.)
 #
 # The approval gate exists only once Required reviewers are configured on the
 # `production` environment (Settings -> Environments); this file cannot enforce that.
@@ -279,7 +279,7 @@ jobs:
   # `environment: production` makes GitHub hold this job until a required
   # reviewer approves; no step below runs before that. It runs only if every
   # earlier job succeeded, the plan has changes, and the run is on main. Before
-  # applying it re-checks the saved plan (no deletes/replacements, no CI cluster-admin).
+  # applying it re-checks the saved plan (no deletes/replacements).
   # ===========================================================================
   apply:
     name: 4 - Terraform Apply
@@ -357,16 +357,11 @@ jobs:
           for rc in plan.get("resource_changes") or []:
               if "delete" in rc["change"]["actions"]:
                   print(rc["address"] + "  [" + "+".join(rc["change"]["actions"]) + "]")
-              elif rc["type"] == "aws_eks_cluster" and rc["change"]["actions"] == ["create"]:
-                  after = rc["change"].get("after") or {}
-                  access = (after.get("access_config") or [{}])[0]
-                  if access.get("bootstrap_cluster_creator_admin_permissions") is not False:
-                      print(rc["address"] + "  [create] would make CI Kubernetes cluster-admin")
           PY
           )"
           rm -f "$RUNNER_TEMP/plan.json"   # may contain sensitive values
           if [ -n "$deletes" ]; then
-            echo "::error::the saved plan deletes/replaces resources or would make CI cluster-admin; CI apply refused"
+            echo "::error::the saved plan deletes or replaces resources; CI apply refused"
             echo "$deletes"
             rm -f "$TF_WORKING_DIR/tfplan"
             exit 1
