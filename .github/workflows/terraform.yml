@@ -1,36 +1,56 @@
-# Terraform infrastructure pipeline: plan -> manual approval -> apply.
+# =============================================================================
+# Workflow metadata
+# =============================================================================
+# Terraform infrastructure pipeline: init -> validate -> plan -> approval -> apply.
 #
-#   plan    you start the workflow by hand   init, validate, plan (-out=tfplan);
-#                                            the plan is encrypted and uploaded as an artifact
-#   apply   runs in the `production`         GitHub waits for a required reviewer to approve
-#           environment                      BEFORE any apply command runs; applies the EXACT
-#                                            plan from the plan job (no new plan), then prints
-#                                            the Terraform outputs
+#   init      checkout, AWS identity check, Terraform setup, backend initialisation
+#   validate  terraform fmt -check, terraform validate (no AWS credentials needed)
+#   plan      terraform plan -out=tfplan, resource allow-list check, GPG-encrypted
+#             plan uploaded as an artifact
+#   apply     runs in the `production` environment: GitHub holds the job until a
+#             required reviewer approves, BEFORE any apply step runs. Downloads the
+#             EXACT encrypted plan, verifies its SHA-256, decrypts it, applies it
+#             (no new plan), then prints the Terraform outputs.
+#
+# Each job runs on a fresh GitHub-hosted runner, so every job that needs Terraform
+# checks out the code, installs Terraform and initialises on its own. Nothing is
+# shared between jobs except job outputs and the encrypted plan artifact.
 #
 # Only `workflow_dispatch`: nothing here runs on push or pull_request.
 # Setup (secrets, variables, GitHub Environment): see docs/OPERATIONS.md "Terraform workflow".
 #
-# IMPORTANT: this uses the CI identity, which has NO IAM, KMS or EC2/VPC write
-# permissions (they are Admin-only). A plan that changes those resources is
-# reported, but is NOT offered for apply. Apply it as an admin instead.
+# IMPORTANT: this uses the CI identity (AWS access keys), which has NO IAM, KMS or
+# EC2/VPC write permissions (they are Admin-only). A plan that changes those
+# resources is reported, but is NOT offered for apply. Apply it as an admin instead.
+# The approval gate exists only once Required reviewers are configured on the
+# `production` environment (Settings -> Environments); this file cannot enforce that.
 name: infra Terraform
 
 on:
   workflow_dispatch:
 
+# =============================================================================
+# Permissions
+# =============================================================================
 # Least privilege by default; no job needs more than read access to the repo.
 permissions:
   contents: read
 
+# =============================================================================
+# Concurrency
+# =============================================================================
 # One infrastructure run at a time. Runs are queued, never cancelled: cancelling
 # while a plan is waiting for approval or an apply is running could leave state half-changed.
 concurrency:
   group: terraform-infra
   cancel-in-progress: false
 
+# =============================================================================
+# Global environment variables
+# =============================================================================
 env:
   TF_WORKING_DIR: terraform # verified: this repo's Terraform lives in ./terraform (there is no EKS-Terraform folder)
-  TF_VERSION: "1.16.2" # exact version: plan and apply must use the same Terraform binary
+  TF_VERSION: "1.16.2" # exact version: every job, and plan and apply in particular, must use the same Terraform binary
   AWS_REGION: us-east-1
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
@@ -39,26 +59,26 @@ env:
   TF_VAR_public_access_cidrs: ${{ vars.PUBLIC_ACCESS_CIDRS }} # JSON list, e.g. ["203.0.113.10/32"]; never 0.0.0.0/0
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # 1. plan: runs automatically after you start the workflow.
-  # ---------------------------------------------------------------------------
-  plan:
-    name: Terraform Plan
+  # ===========================================================================
+  # Job 1: init
+  # Proves, on its own runner, that the commit, the AWS credentials and the S3
+  # backend are usable before anything else runs. Nothing from this job's
+  # working directory is reused later; it only publishes the commit SHA.
+  # ===========================================================================
+  init:
+    name: 1 - Terraform Init
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     outputs:
       sha: ${{ steps.commit.outputs.sha }}
-      has_changes: ${{ steps.plan.outputs.has_changes }}
-      ci_applicable: ${{ steps.guard.outputs.ci_applicable }}
-      plan_sha256: ${{ steps.encrypt.outputs.plan_sha256 }}
-      artifact_name: ${{ steps.encrypt.outputs.artifact_name }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Record commit SHA
+      - name: Verify workflow commit SHA
         id: commit
         run: |
           set -euo pipefail
@@ -83,11 +103,102 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      - name: Terraform Init
+      - name: Terraform Init (S3 backend)
         run: terraform -chdir="$TF_WORKING_DIR" init -backend-config="bucket=${TF_VAR_tfstate_bucket_name}"
+
+  # ===========================================================================
+  # Job 2: validate
+  # Static checks only. It needs no AWS credentials, so it initialises Terraform
+  # without the backend (providers and modules are still downloaded).
+  # ===========================================================================
+  validate:
+    name: 2 - Terraform Validate
+    needs: init
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository (same commit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.init.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify workflow commit SHA
+        env:
+          EXPECTED_SHA: ${{ needs.init.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$EXPECTED_SHA" ] && [ "$EXPECTED_SHA" = "$GITHUB_SHA" ] \
+            || { echo "::error::commit mismatch between jobs"; exit 1; }
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init (no backend)
+        run: terraform -chdir="$TF_WORKING_DIR" init -backend=false
+
+      - name: Terraform Format Check
+        run: terraform -chdir="$TF_WORKING_DIR" fmt -check -recursive
 
       - name: Terraform Validate
         run: terraform -chdir="$TF_WORKING_DIR" validate
+
+  # ===========================================================================
+  # Job 3: plan
+  # Produces the saved plan, checks it against the CI resource allow-list, and
+  # uploads ONLY an encrypted copy. The plain plan never leaves this runner.
+  # ===========================================================================
+  plan:
+    name: 3 - Terraform Plan
+    needs: [init, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+      ci_applicable: ${{ steps.guard.outputs.ci_applicable }}
+      plan_sha256: ${{ steps.encrypt.outputs.plan_sha256 }}
+      artifact_name: ${{ steps.encrypt.outputs.artifact_name }}
+    steps:
+      - name: Checkout repository (same commit)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.init.outputs.sha }}
+          persist-credentials: false
+
+      - name: Verify workflow commit SHA
+        id: commit
+        env:
+          EXPECTED_SHA: ${{ needs.init.outputs.sha }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          [ "$sha" = "$EXPECTED_SHA" ] && [ "$sha" = "$GITHUB_SHA" ] \
+            || { echo "::error::commit mismatch between jobs"; exit 1; }
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        # Prints only the caller ARN, never credentials.
+        run: aws sts get-caller-identity --query Arn --output text
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init (S3 backend)
+        run: terraform -chdir="$TF_WORKING_DIR" init -backend-config="bucket=${TF_VAR_tfstate_bucket_name}"
 
       - name: Terraform Plan
         id: plan
@@ -177,16 +288,18 @@ jobs:
         if: always()
         run: rm -f "$TF_WORKING_DIR/tfplan" "$TF_WORKING_DIR/tfplan.gpg" "$RUNNER_TEMP/plan.json"
 
-  # ---------------------------------------------------------------------------
-  # 2. apply: waits for manual approval (environment: production).
-  #    GitHub does not start this job, and no step runs, until a required
-  #    reviewer approves. Only runs for the main branch, and only for plans
-  #    that CI is allowed to apply.
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # Job 4: apply (manual approval)
+  # `environment: production` makes GitHub hold this job until a required
+  # reviewer approves; no step below runs before that. It runs only if every
+  # earlier job succeeded, the plan has changes, CI is allowed to apply them,
+  # and the run is on main.
+  # ===========================================================================
   apply:
-    name: Terraform Apply
-    needs: plan
+    name: 4 - Terraform Apply
+    needs: [init, validate, plan]
     if: >-
+      success() &&
       needs.plan.outputs.has_changes == 'true' &&
       needs.plan.outputs.ci_applicable == 'true' &&
       github.ref == 'refs/heads/main'
@@ -227,7 +340,7 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
-      - name: Terraform Init
+      - name: Terraform Init (S3 backend)
         run: terraform -chdir="$TF_WORKING_DIR" init -backend-config="bucket=${TF_VAR_tfstate_bucket_name}"
 
       - name: Download plan artifact
