@@ -57,13 +57,17 @@ data "aws_iam_policy_document" "ci_role_boundary" {
     resources = ["*"] # not resource-scopable
   }
 
+  # Nodes must also pull the EKS add-on images (vpc-cni/aws-node, kube-proxy, CoreDNS,
+  # pause) from AWS-owned ECR registries in other accounts. Limiting pulls to this
+  # project's repository left the CNI unable to start, so nodes never became Ready
+  # (NodeCreationFailure). Read-only pull actions, any repository, this region only.
   statement {
-    sid = "EcrPullFromProjectRepositories"
+    sid = "EcrPullForNodes"
     actions = [
       "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
       "ecr:DescribeImages", "ecr:DescribeRepositories", "ecr:ListImages",
     ]
-    resources = ["${local.arn_prefix}:ecr:${var.aws_region}:${local.account_id}:repository/${var.ecr_repository_name}"]
+    resources = ["${local.arn_prefix}:ecr:${var.aws_region}:*:repository/*"]
   }
 
   statement {
